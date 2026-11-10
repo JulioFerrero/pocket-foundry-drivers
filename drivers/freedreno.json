@@ -6,9 +6,13 @@
   "licence": "MIT",
   "priority": 2,
   "for": "Adreno 6xx and newer",
-  "gpus": ["Adreno (TM) 6??", "Adreno (TM) 7??", "Adreno (TM) 8??", "Adreno (TM) X*"],
+  "gpus": ["Adreno (TM) 6*", "Adreno (TM) 7*", "Adreno (TM) 8*", "Adreno (TM) X*"],
   "env": {"MESA_LOADER_DRIVER_OVERRIDE": "kgsl"},
-  "tested": [],
+  "tested": [
+    {"phone": "Nothing Phone (1)", "gpu": "Adreno (TM) 642L", "result": "plays"},
+    {"phone": "POCO X5 Pro 5G", "gpu": "Adreno (TM) 642L", "result": "plays",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/36"}
+  ],
   "source": {
     "git": "https://github.com/lfdevs/mesa-for-android-container",
     "ref": "eb3e7fd4f009cab04b1482aad4843c0bde28a786"

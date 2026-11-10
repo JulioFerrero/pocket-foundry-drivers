@@ -6,17 +6,33 @@
   "licence": "MIT",
   "priority": 1,
   "for": "Adreno 6xx and newer",
-  "gpus": ["Adreno (TM) 6??", "Adreno (TM) 7??", "Adreno (TM) 8??", "Adreno (TM) X*"],
+  "gpus": ["Adreno (TM) 6*", "Adreno (TM) 7*", "Adreno (TM) 8*", "Adreno (TM) X*"],
   "settings": [
     {"id": "noubwc", "label": "No image compression", "about": "Try it if the screen flashes black.",
      "env": {"TU_DEBUG": "noubwc"}}
   ],
   "tested": [
     {"phone": "vivo X200 Ultra", "gpu": "Adreno (TM) 830", "android": 16, "result": "plays", "fps": "60"},
-    {"phone": "Galaxy S23", "gpu": "Adreno (TM) 740", "android": 16, "result": "plays", "fps": "59",
-     "app": "0.8.17-beta.6", "date": "2026-11-09"},
-    {"phone": "Galaxy Tab S9 Ultra", "gpu": "Adreno (TM) 740", "android": 15, "result": "plays",
-     "date": "2026-11-09"}
+    {"phone": "Galaxy S23", "gpu": "Adreno (TM) 740", "android": 16,
+     "result": "plays", "fps": "59", "app": "0.8.17-beta.6", "date": "2026-11-09"},
+    {"phone": "Galaxy Tab S9 Ultra", "gpu": "Adreno (TM) 740", "android": 15, "result": "plays", "date": "2026-11-09"},
+    {"phone": "Galaxy S25 Ultra", "gpu": "Adreno (TM) 830", "result": "plays", "fps": "60",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/69"},
+    {"phone": "OnePlus 15", "gpu": "Adreno (TM) 840", "result": "plays"},
+    {"phone": "Galaxy S24 Ultra", "gpu": "Adreno (TM) 750", "result": "plays"},
+    {"phone": "Xiaomi 13", "gpu": "Adreno (TM) 740", "result": "plays"},
+    {"phone": "AYN Thor", "gpu": "Adreno (TM) 740", "result": "plays", "fps": "60"},
+    {"phone": "POCO F5 Pro", "gpu": "Adreno (TM) 730", "result": "plays", "fps": "60",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/20"},
+    {"phone": "Galaxy Z Fold 8 Ultra", "gpu": "Adreno", "result": "plays"},
+    {"phone": "Retroid Pocket Flip 2", "gpu": "Adreno (TM) 650", "result": "plays"},
+    {"phone": "Galaxy S20 FE", "gpu": "Adreno (TM) 650", "result": "plays",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/12"},
+    {"phone": "Redmi Note 10 Pro", "gpu": "Adreno (TM) 618", "result": "plays",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/17"},
+    {"phone": "Nothing Phone (1)", "gpu": "Adreno (TM) 642L", "result": "garbled text"},
+    {"phone": "POCO X5 Pro 5G", "gpu": "Adreno (TM) 642L", "result": "garbled text",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/36"}
   ],
   "source": {
     "git": "https://github.com/lfdevs/mesa-for-android-container",
