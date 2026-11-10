@@ -19,7 +19,7 @@ app's runtime. Once merged, it's released and joins the catalog.
 | `version` | Shown instead of the Mesa version, for forks with their own |
 | `builtFor` | The phone it was made for, if it was made for one |
 | `for` | The GPUs it's for, as the app shows them: `Adreno 6xx and newer` |
-| `gpus` | The same GPUs as Android names them, to match the phone's: `Adreno (TM) 7??`, `Mali-G76*` |
+| `gpus` | The same GPUs as Android names them, to match the phone's: `*Adreno (TM) 7*`, `*Mali-G76*`. Start and end with `*`: on some phones Android wraps the name, as in `ANGLE ((Samsung Xclipse 540) on Vulkan 1.3.279)` |
 | `family` | GPUs it might work on: they see it under To try |
 | `android` | `{"min": 12}`: the oldest Android it runs on |
 | `priority` | Lower comes first when several fit a GPU |

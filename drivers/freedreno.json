@@ -6,7 +6,7 @@
   "licence": "MIT",
   "priority": 2,
   "for": "Adreno 6xx and newer",
-  "gpus": ["Adreno (TM) 6*", "Adreno (TM) 7*", "Adreno (TM) 8*", "Adreno (TM) X*"],
+  "gpus": ["*Adreno (TM) 6*", "*Adreno (TM) 7*", "*Adreno (TM) 8*", "*Adreno (TM) X*"],
   "env": {"MESA_LOADER_DRIVER_OVERRIDE": "kgsl"},
   "tested": [
     {"phone": "Nothing Phone (1)", "gpu": "Adreno (TM) 642L", "result": "plays"},
