@@ -75,12 +75,7 @@ jobs:
         run: |
           for build in out/*.build.json; do
               [ -e "$build" ] || continue
-              id=$(basename "$build" .build.json)
-              tag="$id-$(build/recipe.sh "drivers/$id.json")"
-              name=$(jq -r .name "drivers/$id.json")
-              source=$(jq -r '.source.git + " at " + .source.ref' "drivers/$id.json")
-              gh release create "$tag" "out/$id.tar.xz" "$build" --latest=false \
-                  --title "$name $(jq -r .mesa "$build")" --notes "Built from $source by this repository's CI."
+              build/release.sh create "$(basename "$build" .build.json)" out
           done
       - name: The signed catalog
         env:
@@ -95,3 +90,9 @@ jobs:
           gh release view catalog > /dev/null 2>&1 || gh release create catalog --latest=false --title Catalog \
               --notes "The catalog Pocket Foundry reads: every driver, its file and where it was tested."
           gh release upload catalog catalog.json catalog.json.sig --clobber
+          # The index of every driver, first on the Releases page.
+          gh release edit catalog --latest
+      - name: Builds the catalog no longer points to
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: build/release.sh prune catalog.json
