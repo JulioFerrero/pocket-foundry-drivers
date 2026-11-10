@@ -1,0 +1,50 @@
+{
+  "name": "PanVK-kbase",
+  "kind": "vulkan",
+  "version": "0.1.0 RC3",
+  "about": "Mesa's open Vulkan driver for Mali, talking to Arm's kernel driver on Android phones.",
+  "madeBy": "zenithblue",
+  "licence": "MIT",
+  "priority": 1,
+  "for": "Mali-G77, G78",
+  "gpus": ["Mali-G77*", "Mali-G78*"],
+  "family": {
+    "name": "Mali Valhall",
+    "gpus": ["Mali-G57*", "Mali-G68*", "Mali-G77*", "Mali-G78*", "Mali-G310*", "Mali-G510*", "Mali-G610*",
+             "Mali-G615*", "Mali-G710*", "Mali-G715*", "Mali-G720*", "Mali-G725*", "Mali-G925*"]
+  },
+  "env": {"MESA_VK_WSI_DEBUG": "sw"},
+  "compression": "cpu",
+  "tested": [
+    {"phone": "Xiaomi 11T", "gpu": "Mali-G77", "result": "plays", "fps": "60",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/55"},
+    {"phone": "Pixel 6", "gpu": "Mali-G78", "result": "plays",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/11"},
+    {"phone": "Poco M6 Pro 4G", "gpu": "Mali-G57", "result": "plays", "fps": "25-30",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/25"},
+    {"phone": "Galaxy Tab S10 Ultra", "gpu": "Mali-G720-Immortalis MC12", "android": 16, "result": "menu"}
+  ],
+  "source": {
+    "git": "https://github.com/zenithblue-oss/panvk-kbase-android",
+    "ref": "panvk-kbase-v0.1.0-rc3"
+  },
+  "build": {
+    "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
+                 "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
+    "prepare": [
+      "git init -q work/mesa && git -C work/mesa remote add origin \"$(python3 -c 'import json; print(json.load(open(\"sources.lock\"))[\"mesaRepo\"])')\"",
+      "sh scripts/fetch-mesa.sh \"$PWD/work\"",
+      "sh scripts/apply-patches.sh --profile g615-v11-csf --mesa \"$PWD/work/mesa\""
+    ],
+    "mesa": "work/mesa",
+    "licences": ["NOTICE.md", "LICENSES/MIT.txt"],
+    "options": [
+      "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=panfrost", "-Dpanfrost-kmds=kbase",
+      "-Dmesa-clc=enabled", "-Dprecomp-compiler=enabled", "-Dllvm=enabled", "-Dshared-llvm=enabled",
+      "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled", "-Dgles2=disabled",
+      "-Dopengl=false", "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false", "-Dhtml-docs=disabled",
+      "-Dvalgrind=disabled", "-Dlibunwind=disabled", "-Dlmsensors=disabled", "-Dxlib-lease=disabled",
+      "-Dzstd=enabled", "-Dexpat=enabled"
+    ]
+  }
+}
