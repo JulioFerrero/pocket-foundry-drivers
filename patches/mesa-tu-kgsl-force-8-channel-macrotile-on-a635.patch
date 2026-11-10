@@ -1,0 +1,27 @@
+From 31f1ceddffcd5f416aa297be3be5193fe41948c9 Mon Sep 17 00:00:00 2001
+From: genie1997 <genie1997.dev@gmail.com>
+Date: Sun, 1 Nov 2026 00:36:32 +0000
+Subject: [PATCH] tu/kgsl: Force 8-channel macrotile mode on A635
+
+Fixes: 66bdb50736f3 ("tu: Gather UBWC config")
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45816>
+---
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 3856e92ac8b8..68a684b52bc9 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -2059,7 +2059,7 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
+    /* kgsl unfortunately hardcodes some settings for certain GPUs and doesn't
+     * expose them in the uAPI so hardcode them here to match.
+     */
+-   if (device->dev_id.gpu_id == 663 || device->dev_id.gpu_id == 680) {
++   if (device->dev_id.gpu_id == 635 || device->dev_id.gpu_id == 663 || device->dev_id.gpu_id == 680) {
+       device->ubwc_config.macrotile_mode = FDL_MACROTILE_8_CHANNEL;
+    }
+    if (device->dev_id.gpu_id == 663) {
+-- 
+GitLab
+
