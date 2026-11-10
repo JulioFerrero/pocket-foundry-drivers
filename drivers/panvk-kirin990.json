@@ -8,10 +8,10 @@
   "builtFor": "Huawei P40",
   "priority": 1,
   "for": "Mali-G76",
-  "gpus": ["Mali-G76*"],
+  "gpus": ["*Mali-G76*"],
   "family": {
     "name": "Mali Bifrost",
-    "gpus": ["Mali-G31*", "Mali-G51*", "Mali-G52*", "Mali-G71*", "Mali-G72*", "Mali-G76*"]
+    "gpus": ["*Mali-G31*", "*Mali-G51*", "*Mali-G52*", "*Mali-G71*", "*Mali-G72*", "*Mali-G76*"]
   },
   "env": {"MESA_VK_WSI_DEBUG": "sw", "PANVK_ERRORS_FILE": "0"},
   "compression": "cpu",

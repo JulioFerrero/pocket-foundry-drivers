@@ -2,7 +2,7 @@
   "name": "PanVK on the Mali-G715 and newer",
   "about": "Without image compression and with BC textures decoded on the GPU, PanVK-kbase gets the game to the main menu on these Malis.",
   "drivers": ["panvk-kbase"],
-  "gpus": ["Mali-G715*", "Mali-G720*", "Mali-G725*", "Mali-G925*"],
+  "gpus": ["*Mali-G715*", "*Mali-G720*", "*Mali-G725*", "*Mali-G925*"],
   "env": {"PANVK_DEBUG": "noafbc,bc_compute"},
   "tested": [
     {"phone": "Galaxy Tab S10 Ultra", "gpu": "Mali-G720-Immortalis MC12", "android": 16, "result": "menu"}

@@ -7,8 +7,8 @@
   "licence": "MIT",
   "priority": 1,
   "for": "Samsung Xclipse",
-  "gpus": ["Samsung Xclipse 920", "Samsung Xclipse 530", "Samsung Xclipse 940", "Samsung Xclipse 540",
-           "Samsung Xclipse 550", "Samsung Xclipse 950", "Samsung Xclipse 960"],
+  "gpus": ["*Samsung Xclipse 920*", "*Samsung Xclipse 530*", "*Samsung Xclipse 940*", "*Samsung Xclipse 540*",
+           "*Samsung Xclipse 550*", "*Samsung Xclipse 950*", "*Samsung Xclipse 960*"],
   "env": {"MESA_VK_WSI_DEBUG": "sw"},
   "tested": [
     {"phone": "Galaxy S25 FE", "gpu": "Samsung Xclipse 940", "version": "1.8.0", "result": "plays", "fps": "60",

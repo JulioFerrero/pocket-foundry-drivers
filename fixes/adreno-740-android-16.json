@@ -2,7 +2,7 @@
   "name": "No black flashes on Android 16",
   "about": "The Qualcomm driver Android 16 brings sets the Adreno 740's UBWC flag hint, which Mesa leaves off. Unmatched, the screen flashed black and left black lines in the terrain.",
   "drivers": ["turnip", "freedreno"],
-  "gpus": ["Adreno (TM) 740"],
+  "gpus": ["*Adreno (TM) 740*"],
   "android": {"min": 16},
   "env": {"FD_DEV_FEATURES": "enable_tp_ubwc_flag_hint=1"},
   "tested": [

@@ -6,7 +6,7 @@
   "licence": "MIT",
   "priority": 1,
   "for": "Adreno 6xx and newer",
-  "gpus": ["Adreno (TM) 6*", "Adreno (TM) 7*", "Adreno (TM) 8*", "Adreno (TM) X*"],
+  "gpus": ["*Adreno (TM) 6*", "*Adreno (TM) 7*", "*Adreno (TM) 8*", "*Adreno (TM) X*"],
   "settings": [
     {"id": "noubwc", "label": "No image compression", "about": "Try it if the screen flashes black.",
      "env": {"TU_DEBUG": "noubwc"}}
