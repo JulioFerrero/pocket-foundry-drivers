@@ -26,7 +26,7 @@ app's runtime. Once merged, it's released and joins the catalog.
 | `env` | Set whenever it draws |
 | `settings` | Checkboxes in the app: `{"id", "label", "about", "env"}` |
 | `compression` | `cpu` where the game's texture compressor fails on it |
-| `tested` | Phones it ran on: `{"phone", "gpu", "android", "result", "fps", "app", "date", "link"}` |
+| `tested` | Phones it ran on: `phone`, `gpu`, `android`, the driver's `version`, `result`, `fps`, `app`, `date`, `link` |
 | `source` | `{"git", "ref"}`: a repository and a commit or tag |
 | `build` | `packages` to install, `prepare` steps the source needs, `mesa` (where Mesa's tree ends up), `patches` from `patches/`, Meson `options`, `licences` to ship |
 
