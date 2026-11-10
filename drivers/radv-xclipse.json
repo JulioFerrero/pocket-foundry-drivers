@@ -1,7 +1,7 @@
 {
   "name": "RADV for Xclipse",
   "kind": "vulkan",
-  "version": "1.8.0",
+  "version": "1.9.0 RC1",
   "about": "Mesa's RADV, ported by JimVulkan to Samsung's Xclipse GPUs and their kernel driver.",
   "madeBy": "JimVulkan",
   "licence": "MIT",
@@ -11,14 +11,14 @@
            "Samsung Xclipse 550", "Samsung Xclipse 950", "Samsung Xclipse 960"],
   "env": {"MESA_VK_WSI_DEBUG": "sw"},
   "tested": [
-    {"phone": "Galaxy S25 FE", "gpu": "Samsung Xclipse 940", "result": "plays", "fps": "60",
+    {"phone": "Galaxy S25 FE", "gpu": "Samsung Xclipse 940", "version": "1.8.0", "result": "plays", "fps": "60",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/18"},
-    {"phone": "Galaxy A56", "gpu": "Samsung Xclipse 540", "result": "plays",
+    {"phone": "Galaxy A56", "gpu": "Samsung Xclipse 540", "version": "1.8.0", "result": "plays",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/62"}
   ],
   "source": {
     "git": "https://github.com/JimVulkan/radv-xclipse",
-    "ref": "v1.8.0"
+    "ref": "v1.9.0-RC1"
   },
   "build": {
     "prepare": [

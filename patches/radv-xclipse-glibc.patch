@@ -26,10 +26,10 @@ index 0000000..27376e6
 +}
 diff --git a/include/sys/system_properties.h b/include/sys/system_properties.h
 new file mode 100644
-index 0000000..03dfb5c
+index 0000000..8ded258
 --- /dev/null
 +++ b/include/sys/system_properties.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,31 @@
 +/* Stand-in for Android's <sys/system_properties.h> in a glibc build: no properties, every one reads empty. */
 +#pragma once
 +
@@ -54,6 +54,12 @@ index 0000000..03dfb5c
 +   void (*callback)(void *cookie, const char *name, const char *value, unsigned serial), void *cookie)
 +{
 +   (void)pi; (void)callback; (void)cookie;
++}
++
++static inline int __system_property_foreach(void (*propfn)(const prop_info *pi, void *cookie), void *cookie)
++{
++   (void)propfn; (void)cookie;
++   return 0;
 +}
 diff --git a/src/amd/common/ac_cmdbuf.c b/src/amd/common/ac_cmdbuf.c
 index 424da78..31a69eb 100644
@@ -96,7 +102,7 @@ index 424da78..31a69eb 100644
        AC_XCLIPSE_LOGP(ANDROID_LOG_ERROR, "RADV_ARM",
                            "[ARM] VA32 VIOLATION #%u: va=0x%llx -- the shader completes this "
 diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
-index 1b08520..bb55c20 100644
+index 3c49341..6acccab 100644
 --- a/src/amd/common/ac_gpu_info.c
 +++ b/src/amd/common/ac_gpu_info.c
 @@ -4,6 +4,8 @@
@@ -117,7 +123,7 @@ index 1b08520..bb55c20 100644
  #include <sys/system_properties.h>
  #endif
  
-@@ -272,7 +274,7 @@ xclipse_knob_hex(const char *env_name, const char *prop_name, const char **src_o
+@@ -288,7 +290,7 @@ xclipse_knob_hex(const char *env_name, const char *prop_name, const char **src_o
        t = e;
        *src_out = "env";
     }
@@ -126,7 +132,7 @@ index 1b08520..bb55c20 100644
     if (!t && __system_property_get(prop_name, v) > 0 && v[0]) {
        t = v;
        *src_out = "prop";
-@@ -303,7 +305,7 @@ xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_o
+@@ -319,7 +321,7 @@ xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_o
           return (int)l;
        }
     }
@@ -135,7 +141,7 @@ index 1b08520..bb55c20 100644
     {
        char v[92] = {0};
        if (__system_property_get(prop_name, v) > 0 && v[0]) {
-@@ -349,7 +351,7 @@ ac_detect_xclipse_model(uint32_t device_id, uint32_t chip_rev)
+@@ -365,7 +367,7 @@ ac_detect_xclipse_model(uint32_t device_id, uint32_t chip_rev)
     from_rev = ac_model_from_chip_rev(chip_rev);
     model = from_rev;
  
@@ -297,7 +303,7 @@ index 01a07cc..cd4fe07 100644
     if (__system_property_get("debug.radv_xclipse_bvh_w64", v) > 0 && v[0])
        return atoi(v) == 0;
 diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
-index 0fc4cba..7e48bdc 100644
+index fc2235a..4043c6a 100644
 --- a/src/amd/vulkan/radv_cmd_buffer.c
 +++ b/src/amd/vulkan/radv_cmd_buffer.c
 @@ -8,6 +8,8 @@
@@ -356,7 +362,7 @@ index 0e8085a..6259e95 100644
  #define RADV_CPU_T1(b)  radv_cpushare_add((b), radv_cpushare_now() - _radv_cpu_t0)
  #else
 diff --git a/src/amd/vulkan/radv_formats.c b/src/amd/vulkan/radv_formats.c
-index 5998101..1f45a49 100644
+index 9ec88e6..963a73a 100644
 --- a/src/amd/vulkan/radv_formats.c
 +++ b/src/amd/vulkan/radv_formats.c
 @@ -5,6 +5,8 @@
@@ -369,7 +375,7 @@ index 5998101..1f45a49 100644
  #include <stdlib.h>
  #include "util/detect_os.h"
 diff --git a/src/amd/vulkan/radv_image.c b/src/amd/vulkan/radv_image.c
-index 049e05c..a8e1a39 100644
+index 42ad770..c2bdf76 100644
 --- a/src/amd/vulkan/radv_image.c
 +++ b/src/amd/vulkan/radv_image.c
 @@ -9,9 +9,11 @@
@@ -408,7 +414,7 @@ index 30347fe..7d138f8 100644
  #include <valgrind.h>
  #define VG(x) x
 diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
-index 18797fe..921b1b2 100644
+index 1d75db8..f866331 100644
 --- a/src/amd/vulkan/radv_physical_device.c
 +++ b/src/amd/vulkan/radv_physical_device.c
 @@ -8,6 +8,8 @@
@@ -420,7 +426,7 @@ index 18797fe..921b1b2 100644
  #include <fcntl.h>
  #include <strings.h>
  #include "ac_xclipse_log.h"
-@@ -679,7 +681,7 @@ radv_xclipse_pal_heaps(const struct radv_physical_device *pdev)
+@@ -678,7 +680,7 @@ radv_xclipse_pal_heaps(const struct radv_physical_device *pdev)
        v = atoi(e);
        src = "env";
     }
@@ -430,7 +436,7 @@ index 18797fe..921b1b2 100644
        char pbuf[PROP_VALUE_MAX] = {0};
        if (__system_property_get("debug.radv_xclipse_pal_heaps", pbuf) > 0 && pbuf[0]) {
 diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
-index cd9d54a..c496d9f 100644
+index c44afb9..9f9223a 100644
 --- a/src/amd/vulkan/radv_queue.c
 +++ b/src/amd/vulkan/radv_queue.c
 @@ -8,6 +8,8 @@
