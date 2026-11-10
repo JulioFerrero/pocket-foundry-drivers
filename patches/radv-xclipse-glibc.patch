@@ -1,0 +1,637 @@
+diff --git a/include/android/log.h b/include/android/log.h
+new file mode 100644
+index 0000000..27376e6
+--- /dev/null
++++ b/include/android/log.h
+@@ -0,0 +1,20 @@
++/* Stand-in for Android's <android/log.h> in a glibc build: the driver's log lines go to stderr. */
++#pragma once
++#include <stdarg.h>
++#include <stdio.h>
++
++enum {
++   ANDROID_LOG_UNKNOWN, ANDROID_LOG_DEFAULT, ANDROID_LOG_VERBOSE, ANDROID_LOG_DEBUG,
++   ANDROID_LOG_INFO, ANDROID_LOG_WARN, ANDROID_LOG_ERROR, ANDROID_LOG_FATAL, ANDROID_LOG_SILENT,
++};
++
++static inline int __android_log_print(int prio, const char *tag, const char *fmt, ...)
++{
++   va_list args;
++   va_start(args, fmt);
++   fprintf(stderr, "%s: ", tag);
++   int n = vfprintf(stderr, fmt, args);
++   fputc('\n', stderr);
++   va_end(args);
++   return n;
++}
+diff --git a/include/sys/system_properties.h b/include/sys/system_properties.h
+new file mode 100644
+index 0000000..03dfb5c
+--- /dev/null
++++ b/include/sys/system_properties.h
+@@ -0,0 +1,25 @@
++/* Stand-in for Android's <sys/system_properties.h> in a glibc build: no properties, every one reads empty. */
++#pragma once
++
++#define PROP_VALUE_MAX 92
++
++typedef struct prop_info prop_info;
++
++static inline int __system_property_get(const char *name, char *value)
++{
++   (void)name;
++   value[0] = '\0';
++   return 0;
++}
++
++static inline const prop_info *__system_property_find(const char *name)
++{
++   (void)name;
++   return 0;
++}
++
++static inline void __system_property_read_callback(const prop_info *pi,
++   void (*callback)(void *cookie, const char *name, const char *value, unsigned serial), void *cookie)
++{
++   (void)pi; (void)callback; (void)cookie;
++}
+diff --git a/src/amd/common/ac_cmdbuf.c b/src/amd/common/ac_cmdbuf.c
+index 424da78..31a69eb 100644
+--- a/src/amd/common/ac_cmdbuf.c
++++ b/src/amd/common/ac_cmdbuf.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "ac_cmdbuf.h"
+ #include "ac_xclipse_log.h"
+ #include "ac_pm4.h"
+@@ -17,7 +19,7 @@
+ #include "radv_logcat.h"
+ 
+ #include <stdlib.h>
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -45,7 +47,7 @@ xclipse_knob(const char *env_name, const char *prop_name, const char **src_out)
+       why_not_env = "env-empty->prop";
+    }
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    {
+       char v[92] = {0};
+       if (__system_property_get(prop_name, v) > 0 && v[0]) {
+@@ -80,7 +82,7 @@ ac_xclipse_va32_violation(uint64_t va, uint32_t address32_hi)
+ {
+    static unsigned n;
+    const unsigned i = n++;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (i < 8)
+       AC_XCLIPSE_LOGP(ANDROID_LOG_ERROR, "RADV_ARM",
+                           "[ARM] VA32 VIOLATION #%u: va=0x%llx -- the shader completes this "
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 1b08520..bb55c20 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "ac_gpu_info.h"
+ #include "ac_xclipse_log.h"
+ #include "ac_shader_util.h"
+@@ -182,7 +184,7 @@ ac_titan_regmap_set_level(uint32_t level)
+ 
+ #include <string.h>
+ #include <stdlib.h>
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -272,7 +274,7 @@ xclipse_knob_hex(const char *env_name, const char *prop_name, const char **src_o
+       t = e;
+       *src_out = "env";
+    }
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (!t && __system_property_get(prop_name, v) > 0 && v[0]) {
+       t = v;
+       *src_out = "prop";
+@@ -303,7 +305,7 @@ xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_o
+          return (int)l;
+       }
+    }
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    {
+       char v[92] = {0};
+       if (__system_property_get(prop_name, v) > 0 && v[0]) {
+@@ -349,7 +351,7 @@ ac_detect_xclipse_model(uint32_t device_id, uint32_t chip_rev)
+    from_rev = ac_model_from_chip_rev(chip_rev);
+    model = from_rev;
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (__system_property_get("ro.soc.model", soc) > 0 && soc[0])
+       src = "ro.soc.model";
+ #endif
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index b2ccf07..8284ef2 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "util/os_drm.h"
+ #include "ac_linux_drm.h"
+ #include "util/simple_mtx.h"
+diff --git a/src/amd/common/ac_xclipse_log.h b/src/amd/common/ac_xclipse_log.h
+index c12f0cd..af5e006 100644
+--- a/src/amd/common/ac_xclipse_log.h
++++ b/src/amd/common/ac_xclipse_log.h
+@@ -27,7 +27,7 @@ int ac_xclipse_log_level(void);
+ #endif
+ 
+ /* On glibc Linux (PRoot) <android/log.h> is include/xclipse_linux_compat's, logging to stderr. */
+-#if defined(__ANDROID__) || defined(__linux__)
++#if 1 /* glibc build */ || defined(__linux__)
+ #include <android/log.h>
+ 
+ /* __android_log_print, but free while the level is 0: the arguments are not even evaluated. */
+diff --git a/src/amd/common/radv_log_helper.c b/src/amd/common/radv_log_helper.c
+index 985a215..6d222f7 100644
+--- a/src/amd/common/radv_log_helper.c
++++ b/src/amd/common/radv_log_helper.c
+@@ -3,6 +3,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "radv_logcat.h"
+ #include "ac_xclipse_log.h"
+ #include <android/log.h>
+diff --git a/src/amd/vulkan/meta/radv_meta_bc_decode.c b/src/amd/vulkan/meta/radv_meta_bc_decode.c
+index 5305c7c..bb10089 100644
+--- a/src/amd/vulkan/meta/radv_meta_bc_decode.c
++++ b/src/amd/vulkan/meta/radv_meta_bc_decode.c
+@@ -16,14 +16,14 @@
+ #include "radv_meta.h"
+ #include "vk_format.h"
+ #include "radv_cpushare.h"
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <android/log.h>
+ #include <time.h>
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
+ #endif
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ /* [BCREPEAT]: is the app re-uploading the same textures? Counts decodes by two keys:
+  *   SURFACE key -- image pointer + mip
+  *   SHAPE key   -- format + width + height + mip
+@@ -538,7 +538,7 @@ get_pipeline(struct radv_device *device, enum bc_variant variant, VkPipeline *pi
+                                             pipeline_out);
+    const uint64_t _cc_ns = radv_cpushare_now() - _cc_t0;
+    radv_cpushare_add(RADV_CPU_COMPILE, _cc_ns);
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    /* Log compile time per variant (each compiles at most once per process). */
+    {
+       static const char *const vname[BC_VARIANT_COUNT] = {
+@@ -631,7 +631,7 @@ radv_device_finish_meta_xclipse_bc(struct radv_device *device)
+    memset(&device->meta_state.xclipse_bc, 0, sizeof(device->meta_state.xclipse_bc));
+ }
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ /* Claim a ring slot for this dispatch and fold in one that is BC_HASH_LAG decodes old. */
+ static int
+ bc_content_slot(struct radv_device *device, uint32_t w, uint32_t h)
+@@ -724,7 +724,7 @@ bc_decode(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageL
+    extent = vk_image_sanitize_extent(&image->vk, extent);
+    offset = vk_image_sanitize_offset(&image->vk, offset);
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    /* Tracked after sanitising, so the SHAPE key sees the real extent. */
+    if (ac_xclipse_log_level() >= 1) /* census, diagnostics only */
+       bc_rpt_track(image, subresource->mipLevel, format, extent.width, extent.height);
+@@ -821,7 +821,7 @@ bc_decode(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageL
+ 
+    radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    const int hash_slot = bc_content_slot(device, extent.width, extent.height);
+ #else
+    const int hash_slot = -1;
+@@ -849,7 +849,7 @@ bc_decode(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageL
+    radv_compute_dispatch(cmd_buffer, &info);
+    cmd_buffer->state.bc_decode_active--;
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    /* Count decodes and report the rate, summarised (logging each would perturb the storm).
+     * BC emulation cannot be switched off for an A/B: D3D11 titles require textureCompressionBC. */
+    if (ac_xclipse_log_level() >= 1) { /* census, diagnostics only */
+@@ -1004,7 +1004,7 @@ radv_meta_decode_bc_flush(struct radv_cmd_buffer *cmd_buffer, struct radv_image
+    cmd_buffer->state.flush_bits |= radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                                          VK_ACCESS_2_SHADER_WRITE_BIT, 0, image, NULL);
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    /* Regions per copy command, reported as a distribution once per second. One copy per mip means
+     * only cross-command flush deferral helps. */
+    if (ac_xclipse_log_level() >= 1) { /* census, diagnostics only */
+diff --git a/src/amd/vulkan/meta/radv_meta_clear.c b/src/amd/vulkan/meta/radv_meta_clear.c
+index 2c5bdde..aaf2ebb 100644
+--- a/src/amd/vulkan/meta/radv_meta_clear.c
++++ b/src/amd/vulkan/meta/radv_meta_clear.c
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "nir/radv_meta_nir.h"
+ #include "radv_entrypoints.h"
+ #include "radv_formats.h"
+diff --git a/src/amd/vulkan/radv_acceleration_structure.c b/src/amd/vulkan/radv_acceleration_structure.c
+index 01a07cc..cd4fe07 100644
+--- a/src/amd/vulkan/radv_acceleration_structure.c
++++ b/src/amd/vulkan/radv_acceleration_structure.c
+@@ -4,8 +4,10 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "meta/radv_meta.h"
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <sys/system_properties.h>
+ #endif
+ #include "radv_buffer.h"
+@@ -1076,7 +1078,7 @@ radv_xclipse_bvh_wave32(const struct radv_physical_device *pdev)
+    const char *e = getenv("RADV_XCLIPSE_BVH_W64");
+    if (e && e[0])
+       return atoi(e) == 0;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.radv_xclipse_bvh_w64", v) > 0 && v[0])
+       return atoi(v) == 0;
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 0fc4cba..7e48bdc 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <sys/system_properties.h>
+ #include "radv_cmd_buffer.h"
+ #include "meta/radv_meta.h"
+diff --git a/src/amd/vulkan/radv_cp_dma.c b/src/amd/vulkan/radv_cp_dma.c
+index 0b736e3..7ec8948 100644
+--- a/src/amd/vulkan/radv_cp_dma.c
++++ b/src/amd/vulkan/radv_cp_dma.c
+@@ -8,7 +8,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <sys/system_properties.h>
+ #endif
+ #include "radv_cp_dma.h"
+@@ -147,7 +149,7 @@ radv_cs_cp_dma_prefetch(const struct radv_device *device, struct radv_cmd_stream
+    if (nopf < 0) {
+       const char *e = getenv("RADV_XCLIPSE_NOPF");
+       nopf = e && e[0] ? e[0] != '0' : ac_xclipse_chip_info(&pdev->info)->no_cp_dma_prefetch;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       char v[PROP_VALUE_MAX] = {0};
+       if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_nopf", v) > 0 && v[0])
+          nopf = v[0] != '0';
+diff --git a/src/amd/vulkan/radv_cpushare.h b/src/amd/vulkan/radv_cpushare.h
+index 0e8085a..6259e95 100644
+--- a/src/amd/vulkan/radv_cpushare.h
++++ b/src/amd/vulkan/radv_cpushare.h
+@@ -26,7 +26,7 @@ enum {
+    RADV_CPU_NBUCKET
+ };
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ void radv_cpushare_add(int bucket, uint64_t ns);
+ #else
+ /* Off Android (a glibc PRoot build) nothing prints the shares: adding is a no-op. */
+@@ -45,7 +45,7 @@ radv_cpushare_now(void)
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+ }
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #define RADV_CPU_T0()   const uint64_t _radv_cpu_t0 = radv_cpushare_now()
+ #define RADV_CPU_T1(b)  radv_cpushare_add((b), radv_cpushare_now() - _radv_cpu_t0)
+ #else
+diff --git a/src/amd/vulkan/radv_formats.c b/src/amd/vulkan/radv_formats.c
+index 5998101..1f45a49 100644
+--- a/src/amd/vulkan/radv_formats.c
++++ b/src/amd/vulkan/radv_formats.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "radv_formats.h"
+ #include <stdlib.h>
+ #include "util/detect_os.h"
+diff --git a/src/amd/vulkan/radv_image.c b/src/amd/vulkan/radv_image.c
+index 049e05c..a8e1a39 100644
+--- a/src/amd/vulkan/radv_image.c
++++ b/src/amd/vulkan/radv_image.c
+@@ -9,9 +9,11 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "radv_image.h"
+ #include "ac_xclipse_log.h"
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <android/log.h>
+ #endif
+ #include "tools/radv_debug.h"
+@@ -244,7 +246,7 @@ static void
+ radv_log_dcc_decision(struct radv_device *device, const struct radv_image *image,
+                       const VkImageCreateInfo *pCreateInfo, VkFormat format, const char *stage, const char *why)
+ {
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (ac_xclipse_log_level() < 1 || !pCreateInfo ||
+        !(image->vk.usage & (VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR |
+                             VK_IMAGE_USAGE_2_DEPTH_STENCIL_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_STORAGE_BIT_KHR)))
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index 30347fe..7d138f8 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -9,6 +9,8 @@
+  */
+ 
+ #ifdef HAVE_VALGRIND
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <memcheck.h>
+ #include <valgrind.h>
+ #define VG(x) x
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 18797fe..921b1b2 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <fcntl.h>
+ #include <strings.h>
+ #include "ac_xclipse_log.h"
+@@ -679,7 +681,7 @@ radv_xclipse_pal_heaps(const struct radv_physical_device *pdev)
+       v = atoi(e);
+       src = "env";
+    }
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    else {
+       char pbuf[PROP_VALUE_MAX] = {0};
+       if (__system_property_get("debug.radv_xclipse_pal_heaps", pbuf) > 0 && pbuf[0]) {
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index cd9d54a..c496d9f 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "radv_queue.h"
+ #include "radv_cpushare.h"
+ #include "tools/radv_debug_hang.h"
+@@ -31,7 +33,7 @@
+ #include "util/os_time.h"
+ #include "util/u_xclipse_prof.h"
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -676,7 +678,7 @@ radv_xclipse_ctxinit_mode(const struct radv_physical_device *pdev)
+       const char *e = getenv("RADV_XCLIPSE_CTXINIT");
+       if (e && e[0])
+          want = atoi(e);
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       if (want < 0) {
+          char v[PROP_VALUE_MAX] = {0};
+          if (__system_property_get("debug.radv_xclipse_ctxinit", v) > 0 && v[0])
+@@ -717,7 +719,7 @@ radv_xclipse_cb_gl2(void)
+    if (cached < 0) {
+       const char *e = getenv("RADV_XCLIPSE_CBGL2");
+       cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       if (!e || !e[0]) {
+          char v[PROP_VALUE_MAX] = {0};
+          if (__system_property_get("debug.radv_xclipse_cbgl2", v) > 0 && v[0])
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 94cb8a1..c160bce 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "radv_shader.h"
+ #include "ac_xclipse_log.h"
+ #include "meta/radv_meta.h"
+@@ -2861,7 +2863,7 @@ radv_xclipse_prologue_size(const struct radv_physical_device *pdev)
+    if (cached < 0) {
+       const char *e = getenv("RADV_XCLIPSE_SHADER_PROLOGUE");
+       cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       if (!cached) {
+          char v[PROP_VALUE_MAX] = {0};
+          if (__system_property_get("debug.radv_xclipse_shader_prologue", v) > 0 && v[0])
+@@ -3644,7 +3646,7 @@ radv_set_stage_key_robustness(const struct vk_pipeline_robustness_state *rs, mes
+ static void
+ radv_xclipse_log_wave64_crosslane(struct nir_shader *const *shaders, int shader_count)
+ {
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (ac_xclipse_log_level() < 1)
+       return;
+    unsigned shuffles = 0, reads = 0, rotates = 0;
+diff --git a/src/amd/vulkan/radv_xclipse_prof.c b/src/amd/vulkan/radv_xclipse_prof.c
+index f9a2629..74a329a 100644
+--- a/src/amd/vulkan/radv_xclipse_prof.c
++++ b/src/amd/vulkan/radv_xclipse_prof.c
+@@ -30,7 +30,7 @@
+ #include "util/u_xclipse_prof.h"
+ #include "vk_format.h"
+ 
+-#if defined(__ANDROID__) && defined(__aarch64__)
++#if 1 /* glibc build */ && defined(__aarch64__)
+ 
+ #include <dlfcn.h>
+ #include <pthread.h>
+diff --git a/src/amd/vulkan/tools/radv_debug_hang.c b/src/amd/vulkan/tools/radv_debug_hang.c
+index e64989e..13bcafb 100644
+--- a/src/amd/vulkan/tools/radv_debug_hang.c
++++ b/src/amd/vulkan/tools/radv_debug_hang.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -996,7 +998,7 @@ radv_create_dump_dir()
+ #endif
+ }
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ /* Xclipse: an app has no $HOME and no visible stderr, and radv_create_dump_dir() aborts when it
+  * cannot create its directory. Report the hanging pipeline to logcat and save what a replay needs
+  * (SPIR-V, NIR, ACO IR, disassembly, trace ids) to the app's external files directory, which adb
+@@ -1177,7 +1179,7 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
+    if (!hang_occurred)
+       return VK_SUCCESS;
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    /* Keep the app running: report, save the pipeline for a replay, and carry on. */
+    radv_xclipse_report_hang(queue, ring, submit_info);
+    return VK_SUCCESS;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index 4c440df..e8df653 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -9,6 +9,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <stdio.h>
+ #include "ac_xclipse_log.h"
+ 
+@@ -34,7 +36,7 @@
+ 
+ #include <stdint.h>
+ #include <stdlib.h>
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+ #include <sys/system_properties.h>
+ #endif
+ 
+@@ -178,7 +180,7 @@ radv_xclipse_mtype(struct radv_amdgpu_winsys *ws)
+    const char *src = e ? "env" : "default";
+    int v = e ? atoi(e) : -1;
+ 
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+    if (!e) {
+       char pbuf[PROP_VALUE_MAX] = {0};
+       if (__system_property_get("debug.radv_xclipse_mtype", pbuf) > 0 && pbuf[0]) {
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+index 6c908ac..9f0a2ba 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -5,6 +5,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include <assert.h>
+ #include "ac_xclipse_log.h"
+ #include <libsync.h>
+@@ -1867,7 +1869,7 @@ radv_xclipse_user_fence_enabled(struct radv_amdgpu_ctx *ctx)
+    static int uf = -1;
+    if (uf < 0) {
+       const char *e = getenv("RADV_XCLIPSE_UF");
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       char v[PROP_VALUE_MAX] = {0};
+       uf = e ? atoi(e) : (__system_property_get("debug.radv_xclipse_uf", v) > 0 ? atoi(v) : 0);
+ #else
+@@ -1928,7 +1930,7 @@ radv_xclipse_pace_mode(struct radv_amdgpu_ctx *ctx)
+       const char *e = getenv("RADV_XCLIPSE_PACE");
+       if (e && !*e)
+          e = NULL;
+-#ifdef __ANDROID__
++#if 1 /* glibc build: compat/ stands in for Android */
+       char v[PROP_VALUE_MAX] = {0};
+       pace = e ? atoi(e) : (__system_property_get("debug.radv_xclipse_pace", v) > 0 ? atoi(v) : 1);
+ #else
+diff --git a/src/util/u_xclipse_prof.c b/src/util/u_xclipse_prof.c
+index eb7b2f5..62e90cc 100644
+--- a/src/util/u_xclipse_prof.c
++++ b/src/util/u_xclipse_prof.c
+@@ -24,8 +24,10 @@
+  * Nothing here runs on a GPU-waited thread: the signal handler only stores to memory, and all
+  * file I/O happens on the helper thread.
+  */
+-#if defined(__ANDROID__) && defined(__aarch64__)
++#if 1 /* glibc build */ && defined(__aarch64__)
+ 
++#include <android/log.h>   /* glibc build: include/ stands in */
++#include <sys/system_properties.h>
+ #include "u_xclipse_prof.h"
+ 
+ #include <android/log.h>
+diff --git a/src/util/u_xclipse_prof.h b/src/util/u_xclipse_prof.h
+index a49f917..1401730 100644
+--- a/src/util/u_xclipse_prof.h
++++ b/src/util/u_xclipse_prof.h
+@@ -26,7 +26,7 @@ enum u_xclipse_wait {
+    U_XCLIPSE_WAIT_COUNT,
+ };
+ 
+-#if defined(__ANDROID__) && defined(__aarch64__)
++#if 1 /* glibc build */ && defined(__aarch64__)
+ void u_xclipse_prof_start(void);
+ void u_xclipse_prof_frame(void);
+ /* Frames presented so far (for drivers that tag GPU work with a frame). */
