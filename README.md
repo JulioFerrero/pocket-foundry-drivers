@@ -1,8 +1,8 @@
 # Pocket Foundry drivers
 
-The GPU drivers [Pocket Foundry](https://github.com/JulioFerrero/pocket-foundry) downloads. The app itself only has
-the phone's own driver and the CPU. When it starts, and before a game, it reads this repository's catalog, picks the
-driver for the phone's GPU and downloads it.
+The drivers [Pocket Foundry](https://github.com/JulioFerrero/pocket-foundry) downloads. The app itself only has the
+phone's own driver. When it starts, and before a game, it reads this repository's catalog, picks the driver for the
+phone's GPU and downloads it, or the CPU driver when none works.
 
 Every driver here is built from source by this repository's CI, in the app's own build container, so it links
 against what the app ships. Nobody uploads a file.
@@ -15,7 +15,7 @@ app's runtime. Once merged, it's released and joins the catalog.
 | Field | |
 |---|---|
 | `name`, `about`, `madeBy`, `licence` | What the app shows |
-| `kind` | `vulkan`: a Vulkan driver the game reaches through Zink. `opengl`: a whole Mesa OpenGL driver |
+| `kind` | `vulkan`: a Vulkan driver the game reaches through Zink. `opengl`: a whole Mesa OpenGL driver. `cpu`: a whole Mesa that draws on the processor, for any GPU; app versions before 0.8.17-beta.10 skip it |
 | `version` | Shown instead of the Mesa version, for forks with their own |
 | `builtFor` | The phone it was made for, if it was made for one |
 | `for` | The GPUs it's for, as the app shows them: `Adreno 6xx and newer` |
