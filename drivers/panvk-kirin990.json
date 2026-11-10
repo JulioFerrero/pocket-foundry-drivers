@@ -1,7 +1,7 @@
 {
   "name": "PanVK",
   "kind": "vulkan",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "about": "Mesa's open Vulkan driver for Mali, with soulexit's patches for the Kirin 990's kernel driver.",
   "madeBy": "soulexit",
   "licence": "MIT",
@@ -13,18 +13,19 @@
     "name": "Mali Bifrost",
     "gpus": ["Mali-G31*", "Mali-G51*", "Mali-G52*", "Mali-G71*", "Mali-G72*", "Mali-G76*"]
   },
-  "env": {"MESA_VK_WSI_DEBUG": "sw"},
+  "env": {"MESA_VK_WSI_DEBUG": "sw", "PANVK_ERRORS_FILE": "0"},
   "compression": "cpu",
   "tested": [
-    {"phone": "Huawei P30", "gpu": "Mali-G76", "result": "plays", "fps": "60",
+    {"phone": "Huawei P30", "gpu": "Mali-G76", "version": "1.2.8", "result": "plays", "fps": "60",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/56"},
-    {"phone": "Huawei P40", "gpu": "Mali-G76", "android": 10, "result": "menu", "date": "2026-11-05"},
-    {"phone": "Galaxy S10", "gpu": "Mali-G76", "android": 12, "result": "plays", "fps": "29-37",
+    {"phone": "Huawei P40", "gpu": "Mali-G76", "version": "1.2.8", "android": 10, "result": "menu",
+     "date": "2026-11-05"},
+    {"phone": "Galaxy S10", "gpu": "Mali-G76", "version": "1.2.8", "android": 12, "result": "plays", "fps": "29-37",
      "date": "2026-11-10"}
   ],
   "source": {
     "git": "https://github.com/soulexit/panvk-kirin990",
-    "ref": "v1.2.8"
+    "ref": "v1.2.9"
   },
   "build": {
     "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
