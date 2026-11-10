@@ -40,18 +40,18 @@ install=/build/$id-install
 rm -rf "$install" && DESTDIR=$install ninja -C build install
 lib=$install$PREFIX/lib
 
-# What the app installs: a Vulkan driver's library and its ICD manifest, or an OpenGL driver's whole Mesa (glvnd's
-# vendor libraries and the gallium library they load), each under the name the loader asks for.
+# What the app installs: a Vulkan driver's library and its ICD manifest, or an OpenGL or CPU driver's whole Mesa
+# (glvnd's vendor libraries and the gallium library they load), each under the name the loader asks for.
 pkg=/build/$id-package
 rm -rf "$pkg" && mkdir -p "$pkg"
 case $(spec .kind) in
     vulkan)
         cp -L "$lib"/libvulkan_*.so "$pkg/"
         cp "$(ls "$install$PREFIX"/share/vulkan/icd.d/*.json | head -1)" "$pkg/icd.json" ;;
-    opengl)
+    opengl|cpu)
         cp -L "$lib"/libgallium-*.so "$lib/libGLX_mesa.so.0" "$lib/libEGL_mesa.so.0" "$pkg/" ;;
     *)
-        echo "$json: kind must be vulkan or opengl"; exit 1 ;;
+        echo "$json: kind must be vulkan, opengl or cpu"; exit 1 ;;
 esac
 strip --strip-unneeded "$pkg"/*.so*
 [ -f "$mesa/docs/license.rst" ] && cp "$mesa/docs/license.rst" "$pkg/LICENSE-mesa.rst"
