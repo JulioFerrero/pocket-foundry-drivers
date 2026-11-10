@@ -1,0 +1,39 @@
+{
+  "name": "RADV for Xclipse",
+  "kind": "vulkan",
+  "version": "1.8.0",
+  "about": "Mesa's RADV, ported by JimVulkan to Samsung's Xclipse GPUs and their kernel driver.",
+  "madeBy": "JimVulkan",
+  "licence": "MIT",
+  "priority": 1,
+  "for": "Samsung Xclipse",
+  "gpus": ["Samsung Xclipse 920", "Samsung Xclipse 530", "Samsung Xclipse 940", "Samsung Xclipse 540",
+           "Samsung Xclipse 550", "Samsung Xclipse 950", "Samsung Xclipse 960"],
+  "env": {"MESA_VK_WSI_DEBUG": "sw"},
+  "tested": [
+    {"phone": "Galaxy S25 FE", "gpu": "Samsung Xclipse 940", "result": "plays", "fps": "60",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/18"},
+    {"phone": "Galaxy A56", "gpu": "Samsung Xclipse 540", "result": "plays",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/62"}
+  ],
+  "source": {
+    "git": "https://github.com/JimVulkan/radv-xclipse",
+    "ref": "v1.8.0"
+  },
+  "build": {
+    "prepare": [
+      "git init -q /tmp/mesa && git -C /tmp/mesa fetch -q --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git 45ea3ed8ce649d6b72d1843307a29d9cc3b7704e && git -C /tmp/mesa checkout -q FETCH_HEAD",
+      "cp -r /tmp/mesa/src/x11 src/ && cp -r /tmp/mesa/include/pci_ids include/ && cp -rn /tmp/mesa/include/. include/"
+    ],
+    "patches": ["patches/radv-xclipse-glibc.patch"],
+    "licences": ["LICENSE", "THIRD_PARTY_NOTICES.md"],
+    "options": [
+      "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=amd", "-Dllvm=disabled", "-Dopengl=false",
+      "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled", "-Dgles2=disabled",
+      "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false", "-Dvalgrind=disabled", "-Dlibunwind=disabled",
+      "-Dlmsensors=disabled", "-Dxlib-lease=disabled", "-Dxmlconfig=disabled", "-Dperfetto=false",
+      "-Dzstd=enabled", "-Dallow-fallback-for=libdrm", "--force-fallback-for=libdrm",
+      "-Dlibdrm:default_library=static"
+    ]
+  }
+}
