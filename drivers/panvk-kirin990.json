@@ -21,7 +21,9 @@
     {"phone": "Huawei P40", "gpu": "Mali-G76", "version": "1.2.8", "android": 10, "result": "menu",
      "date": "2026-11-05"},
     {"phone": "Galaxy S10", "gpu": "Mali-G76", "version": "1.2.8", "android": 12, "result": "plays", "fps": "29-37",
-     "date": "2026-11-10"}
+     "date": "2026-11-10"},
+    {"phone": "Galaxy S10", "gpu": "Mali-G76 MC12", "android": 12, "version": "1.2.9", "result": "plays",
+     "fps": "17-24", "app": "0.8.17-beta.6", "date": "2026-11-10"}
   ],
   "source": {
     "git": "https://github.com/soulexit/panvk-kirin990",

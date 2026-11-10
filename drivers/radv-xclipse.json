@@ -14,7 +14,9 @@
     {"phone": "Galaxy S25 FE", "gpu": "Samsung Xclipse 940", "version": "1.8.0", "result": "plays", "fps": "60",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/18"},
     {"phone": "Galaxy A56", "gpu": "Samsung Xclipse 540", "version": "1.8.0", "result": "plays",
-     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/62"}
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/62"},
+    {"phone": "Galaxy A56", "gpu": "Samsung Xclipse 540", "android": 16, "version": "1.9.0 RC1", "result": "plays",
+     "fps": "54-59", "app": "0.8.17-beta.6", "date": "2026-11-10"}
   ],
   "source": {
     "git": "https://github.com/JimVulkan/radv-xclipse",

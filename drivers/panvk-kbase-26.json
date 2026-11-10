@@ -21,7 +21,9 @@
   "compression": "cpu",
   "tested": [
     {"phone": "realme 16 Pro", "gpu": "Mali-G615", "result": "plays", "fps": "60",
-     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/35"}
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/35"},
+    {"phone": "Xiaomi 14T", "gpu": "Mali-G615 MC6", "android": 14, "version": "26.3.1", "result": "plays",
+     "fps": "56-59", "app": "0.8.17-beta.6", "date": "2026-11-10"}
   ],
   "source": {
     "git": "https://github.com/zenithblue-oss/panvk-kbase-android",
