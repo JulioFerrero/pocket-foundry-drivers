@@ -14,7 +14,7 @@
   "tested": [
     {"phone": "vivo X200 Ultra", "gpu": "Adreno (TM) 830", "android": 16, "result": "plays", "fps": "60"},
     {"phone": "Galaxy S23", "gpu": "Adreno (TM) 740", "android": 16,
-     "result": "plays", "fps": "59", "app": "0.8.17-beta.6", "date": "2026-11-09"},
+     "result": "plays", "fps": "60", "app": "0.8.17-beta.6", "date": "2026-11-10"},
     {"phone": "Galaxy Tab S9 Ultra", "gpu": "Adreno (TM) 740", "android": 15, "result": "plays", "date": "2026-11-09"},
     {"phone": "Galaxy S25 Ultra", "gpu": "Adreno (TM) 830", "result": "plays", "fps": "60",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/69"},

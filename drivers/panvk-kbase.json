@@ -22,7 +22,9 @@
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/11"},
     {"phone": "Poco M6 Pro 4G", "gpu": "Mali-G57", "result": "plays", "fps": "25-30",
      "link": "https://github.com/JulioFerrero/pocket-foundry/issues/25"},
-    {"phone": "Galaxy Tab S10 Ultra", "gpu": "Mali-G720-Immortalis MC12", "android": 16, "result": "menu"}
+    {"phone": "Galaxy Tab S10 Ultra", "gpu": "Mali-G720-Immortalis MC12", "android": 16, "result": "menu"},
+    {"phone": "Galaxy S20", "gpu": "Mali-G77 MC11", "android": 13, "version": "0.1.0 RC3", "result": "plays",
+     "fps": "37-45", "app": "0.8.17-beta.6", "date": "2026-11-10"}
   ],
   "source": {
     "git": "https://github.com/zenithblue-oss/panvk-kbase-android",
