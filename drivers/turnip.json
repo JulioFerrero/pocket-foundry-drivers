@@ -1,0 +1,35 @@
+{
+  "name": "Zink + Turnip",
+  "kind": "vulkan",
+  "about": "Zink turns the game's OpenGL into Vulkan, and Mesa's Turnip drives the GPU. The fastest on Adreno.",
+  "madeBy": "Mesa",
+  "licence": "MIT",
+  "priority": 1,
+  "for": "Adreno 6xx and newer",
+  "gpus": ["Adreno (TM) 6??", "Adreno (TM) 7??", "Adreno (TM) 8??", "Adreno (TM) X*"],
+  "settings": [
+    {"id": "noubwc", "label": "No image compression", "about": "Try it if the screen flashes black.",
+     "env": {"TU_DEBUG": "noubwc"}}
+  ],
+  "tested": [
+    {"phone": "vivo X200 Ultra", "gpu": "Adreno (TM) 830", "android": 16, "result": "plays", "fps": "60"},
+    {"phone": "Galaxy S23", "gpu": "Adreno (TM) 740", "android": 16, "result": "plays", "fps": "59",
+     "app": "0.8.17-beta.6", "date": "2026-11-09"},
+    {"phone": "Galaxy Tab S9 Ultra", "gpu": "Adreno (TM) 740", "android": 15, "result": "plays",
+     "date": "2026-11-09"}
+  ],
+  "source": {
+    "git": "https://github.com/lfdevs/mesa-for-android-container",
+    "ref": "eb3e7fd4f009cab04b1482aad4843c0bde28a786"
+  },
+  "build": {
+    "patches": ["patches/mesa-x11-wait-for-the-frame-before-presenting.patch"],
+    "options": [
+      "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=freedreno", "-Dfreedreno-kmds=kgsl,msm",
+      "-Dopengl=false", "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled",
+      "-Dgles2=disabled", "-Dllvm=disabled", "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false",
+      "-Dhtml-docs=disabled", "-Dvalgrind=disabled", "-Dlibunwind=disabled", "-Dlmsensors=disabled",
+      "-Dxlib-lease=disabled", "-Dandroid-libbacktrace=disabled", "-Dzstd=enabled", "-Dexpat=enabled"
+    ]
+  }
+}

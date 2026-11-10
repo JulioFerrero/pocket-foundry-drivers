@@ -1,0 +1,48 @@
+{
+  "name": "PanVK",
+  "kind": "vulkan",
+  "version": "1.2.8",
+  "about": "Mesa's open Vulkan driver for Mali, with soulexit's patches for the Kirin 990's kernel driver.",
+  "madeBy": "soulexit",
+  "licence": "MIT",
+  "builtFor": "Huawei P40",
+  "priority": 1,
+  "for": "Mali-G76",
+  "gpus": ["Mali-G76*"],
+  "family": {
+    "name": "Mali Bifrost",
+    "gpus": ["Mali-G31*", "Mali-G51*", "Mali-G52*", "Mali-G71*", "Mali-G72*", "Mali-G76*"]
+  },
+  "env": {"MESA_VK_WSI_DEBUG": "sw"},
+  "compression": "cpu",
+  "tested": [
+    {"phone": "Huawei P30", "gpu": "Mali-G76", "result": "plays", "fps": "60",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/56"},
+    {"phone": "Huawei P40", "gpu": "Mali-G76", "android": 10, "result": "menu", "date": "2026-11-05"},
+    {"phone": "Galaxy S10", "gpu": "Mali-G76", "android": 12, "result": "plays", "fps": "29-37",
+     "date": "2026-11-10"}
+  ],
+  "source": {
+    "git": "https://github.com/soulexit/panvk-kirin990",
+    "ref": "v1.2.8"
+  },
+  "build": {
+    "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
+                 "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
+    "prepare": [
+      "git clone -q https://github.com/zenithblue-oss/panvk-kbase-android tree/zenithblue",
+      "git -C tree/zenithblue fetch -q origin 917b9b3b5ff62d7f17303c13fa9cc924c0f308a3",
+      "sh scripts/prepare-tree.sh \"$PWD/tree\""
+    ],
+    "mesa": "tree/mesa",
+    "licences": ["LICENSE", "NOTICE.md"],
+    "options": [
+      "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=panfrost", "-Dpanfrost-kmds=kbase",
+      "-Dmesa-clc=enabled", "-Dprecomp-compiler=enabled", "-Dllvm=enabled", "-Dshared-llvm=enabled",
+      "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled", "-Dgles2=disabled",
+      "-Dopengl=false", "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false", "-Dhtml-docs=disabled",
+      "-Dvalgrind=disabled", "-Dlibunwind=disabled", "-Dlmsensors=disabled", "-Dxlib-lease=disabled",
+      "-Dzstd=enabled", "-Dexpat=enabled"
+    ]
+  }
+}

@@ -1,0 +1,97 @@
+# Builds every driver whose recipe changed, from source, in Pocket Foundry's build container. On main it also
+# releases them and publishes the signed catalog the app reads.
+name: Drivers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drivers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: build/plan.sh | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build != '[]'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: The app's build container and runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: build/runtime.sh out
+      - name: Build ${{ matrix.driver }}
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out" pocketfoundry-build \
+              bash /repo/build/driver.sh /repo/drivers/${{ matrix.driver }}.json /out /out/runtime-libs.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: driver-${{ matrix.driver }}
+          path: |
+            out/${{ matrix.driver }}.tar.xz
+            out/${{ matrix.driver }}.build.json
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: >-
+      always() && github.event_name != 'pull_request' && needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: driver-*
+          path: out
+          merge-multiple: true
+      - name: Release the new builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for build in out/*.build.json; do
+              [ -e "$build" ] || continue
+              id=$(basename "$build" .build.json)
+              tag="$id-$(build/recipe.sh "drivers/$id.json")"
+              name=$(jq -r .name "drivers/$id.json")
+              source=$(jq -r '.source.git + " at " + .source.ref' "drivers/$id.json")
+              gh release create "$tag" "out/$id.tar.xz" "$build" --latest=false \
+                  --title "$name $(jq -r .mesa "$build")" --notes "Built from $source by this repository's CI."
+          done
+      - name: The signed catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
+        run: |
+          [ -n "$CATALOG_KEY" ] || { echo "The CATALOG_KEY secret is missing"; exit 1; }
+          python3 build/catalog.py out > catalog.json
+          printf '%s\n' "$CATALOG_KEY" > "$RUNNER_TEMP/catalog.key"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/catalog.key" -out catalog.json.sig catalog.json
+          rm "$RUNNER_TEMP/catalog.key"
+          gh release view catalog > /dev/null 2>&1 || gh release create catalog --latest=false --title Catalog \
+              --notes "The catalog Pocket Foundry reads: every driver, its file and where it was tested."
+          gh release upload catalog catalog.json catalog.json.sig --clobber

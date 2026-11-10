@@ -1,0 +1,30 @@
+{
+  "name": "Freedreno",
+  "kind": "opengl",
+  "about": "Mesa's OpenGL driver for Adreno. Slower than Turnip: try it if Turnip shows glitches.",
+  "madeBy": "Mesa",
+  "licence": "MIT",
+  "priority": 2,
+  "for": "Adreno 6xx and newer",
+  "gpus": ["Adreno (TM) 6??", "Adreno (TM) 7??", "Adreno (TM) 8??", "Adreno (TM) X*"],
+  "env": {"MESA_LOADER_DRIVER_OVERRIDE": "kgsl"},
+  "tested": [],
+  "source": {
+    "git": "https://github.com/lfdevs/mesa-for-android-container",
+    "ref": "eb3e7fd4f009cab04b1482aad4843c0bde28a786"
+  },
+  "build": {
+    "patches": [
+      "patches/mesa-dri-submit-the-frame-before-the-hud.patch",
+      "patches/mesa-st-uniform-blocks-with-11-per-stage.patch"
+    ],
+    "options": [
+      "-Dplatforms=x11", "-Dgallium-drivers=freedreno", "-Dvulkan-drivers=", "-Dfreedreno-kmds=kgsl,msm",
+      "-Dglx=dri", "-Degl=enabled", "-Dgbm=disabled", "-Dglvnd=enabled", "-Dgles1=disabled", "-Dgles2=enabled",
+      "-Dllvm=disabled", "-Dgallium-va=disabled", "-Dgallium-rusticl=false", "-Dteflon=false",
+      "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false", "-Dhtml-docs=disabled", "-Dvalgrind=disabled",
+      "-Dlibunwind=disabled", "-Dlmsensors=disabled", "-Dxlib-lease=disabled", "-Dandroid-libbacktrace=disabled",
+      "-Dzstd=enabled", "-Dexpat=enabled"
+    ]
+  }
+}
