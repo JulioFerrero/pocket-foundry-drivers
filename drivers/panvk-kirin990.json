@@ -23,21 +23,27 @@
     {"phone": "Galaxy S10", "gpu": "Mali-G76", "version": "1.2.8", "android": 12, "result": "plays", "fps": "29-37",
      "date": "2026-11-10"},
     {"phone": "Galaxy S10", "gpu": "Mali-G76 MC12", "android": 12, "version": "1.2.9", "result": "plays",
-     "fps": "17-24", "app": "0.8.17-beta.6", "date": "2026-11-10"}
+     "fps": "17-24", "app": "0.8.17-beta.6", "date": "2026-11-10"},
+    {"phone": "Redmi Note 9", "gpu": "Mali-G52 MC2", "android": 11, "version": "1.2.9", "result": "plays",
+     "fps": "25-32", "app": "0.8.17-beta.9", "date": "2026-11-11",
+     "link": "https://github.com/JulioFerrero/pocket-foundry/issues/21"},
+    {"phone": "Redmi 12", "gpu": "Mali-G52 MC2", "android": 14, "version": "1.2.9", "result": "plays",
+     "app": "0.8.17-beta.7", "date": "2026-11-11"}
   ],
   "source": {
     "git": "https://github.com/soulexit/panvk-kirin990",
     "ref": "v1.2.9"
   },
   "build": {
-    "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
-                 "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
+    "packages": ["llvm-19-dev", "libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev",
+                 "llvm-spirv-19", "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
     "prepare": [
       "git clone -q https://github.com/zenithblue-oss/panvk-kbase-android tree/zenithblue",
       "git -C tree/zenithblue fetch -q origin 917b9b3b5ff62d7f17303c13fa9cc924c0f308a3",
       "sh scripts/prepare-tree.sh \"$PWD/tree\""
     ],
     "mesa": "tree/mesa",
+    "patches": ["patches/panvk-kbase-ion-only-when-it-allocates.patch"],
     "licences": ["LICENSE", "NOTICE.md"],
     "options": [
       "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=panfrost", "-Dpanfrost-kmds=kbase",

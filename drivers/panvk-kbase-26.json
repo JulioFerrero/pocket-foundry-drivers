@@ -30,13 +30,14 @@
     "ref": "panvk-kbase-v26.3.1"
   },
   "build": {
-    "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
+    "packages": ["llvm-19-dev", "libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
                  "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
     "prepare": [
       "git init -q work/mesa && git -C work/mesa fetch -q --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git 5a07217f034b3e50d8c7c7794f97a2df1742613b && git -C work/mesa checkout -q FETCH_HEAD",
       "sh scripts/prepare-rc5-tree.sh --mesa \"$PWD/work/mesa\""
     ],
     "mesa": "work/mesa",
+    "patches": ["patches/panvk-kbase-ion-only-when-it-allocates.patch"],
     "licences": ["NOTICE.md", "LICENSES/MIT.txt"],
     "options": [
       "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=panfrost", "-Dpanfrost-kmds=kbase",
