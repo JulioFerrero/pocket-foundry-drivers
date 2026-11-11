@@ -31,7 +31,7 @@
     "ref": "panvk-kbase-v0.1.0-rc3"
   },
   "build": {
-    "packages": ["libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
+    "packages": ["llvm-19-dev", "libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev", "llvm-spirv-19",
                  "libllvmspirvlib-19-dev", "spirv-tools", "python3-ply"],
     "prepare": [
       "git init -q work/mesa && git -C work/mesa remote add origin \"$(python3 -c 'import json; print(json.load(open(\"sources.lock\"))[\"mesaRepo\"])')\"",

@@ -1,0 +1,27 @@
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2013,7 +2013,24 @@
+                }
+             }
+          }
++         /* Some vendor kernels (MediaTek's on Android 13 and 14) answer the
++          * heap query but refuse this ABI's allocation with ENOTTY, and every
++          * BO that needs a dma-buf then fails. Allocate once to know: without
++          * ION, go on as on a kernel that has none. */
+          if (kbase_dev->ion_heap_mask) {
++            struct kbase_ion_alloc probe = {
++               .len = 4096,
++               .heap_id_mask = kbase_dev->ion_heap_mask,
++            };
++            if (ioctl(ion, KBASE_ION_IOC_ALLOC, &probe)) {
++               mesa_logi("kbase: ION system heap doesn't allocate (%s)",
++                         strerror(errno));
++               kbase_dev->ion_heap_mask = 0;
++            } else {
++               close(probe.fd);
++            }
++         }
++         if (kbase_dev->ion_heap_mask) {
+             kbase_dev->dma_heap_fd = ion;
+             kbase_dev->heap_is_ion = true;
+             mesa_logi("kbase: using ION system heap, mask 0x%x",
