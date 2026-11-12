@@ -2,7 +2,8 @@ BC textures that can be read back, as desktop OpenGL allows and OpenGL ES doesn'
 2D texture, kept in a deleted file (a game's atlases are gigabytes), from which glGetCompressedTexImage,
 GL_TEXTURE_COMPRESSED_IMAGE_SIZE and glGetTexImage (decoded, BC1-BC5) answer. Factorio checks its GPU texture
 compressor that way at every start; without it, it aborts ("VideoBitmapOpenGL.cpp:267: data.size() ==
-size_t(size) + offset").
+size_t(size) + offset"). Where OpenGL ES has no BC (Mali), the texture is RGBA8 and every BC upload is decoded
+into it: Factorio makes its mipmapped atlas BC whatever its settings say. MG_BC_DECODE=1 decodes on any GPU.
 
 diff --git a/MobileGlues-cpp/CMakeLists.txt b/MobileGlues-cpp/CMakeLists.txt
 index 0426186..e33ba6d 100644
@@ -18,16 +19,18 @@ index 0426186..e33ba6d 100644
      bench/multidraw_bench.cpp
 diff --git a/MobileGlues-cpp/gl/bc_shadow.cpp b/MobileGlues-cpp/gl/bc_shadow.cpp
 new file mode 100644
-index 0000000..5caea56
+index 0000000..184f795
 --- /dev/null
 +++ b/MobileGlues-cpp/gl/bc_shadow.cpp
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,622 @@
 +// Experiment patch for MobileGlues (LGPL-2.1): BC textures that can be read back.
 +// Desktop GL lets an application read a compressed texture back (glGetCompressedTexImage, glGetTexImage, the
 +// GL_TEXTURE_COMPRESSED_IMAGE_SIZE query); OpenGL ES has none of it, and Factorio's texture processor checks its GPU
 +// compressor that way at every start. This keeps a CPU copy of every BC upload to 2D textures and answers from it:
 +// the bytes as they were uploaded, and RGBA8 decoded on the CPU (BC1-BC5). The copies live in a deleted file in
 +// MG_DIR_PATH, not in memory: a game's whole set of atlases is gigabytes, read back once if at all.
++// Where OpenGL ES has no BC (Mali), the texture is RGBA8 and every BC upload is decoded into it: Factorio makes its
++// mipmapped atlas BC whatever its settings say. MG_BC_DECODE=1 decodes on every GPU, to test that.
 +#include "../includes.h"
 +#include <GL/gl.h>
 +#include "glcorearb.h"
@@ -180,6 +183,103 @@ index 0000000..5caea56
 +    return true;
 +}
 +
++// Whether OpenGL ES takes [format] as it is, from its extensions.
++bool native(GLenum format) {
++    static int s3tc = -1, s3tc_srgb, rgtc, bptc;
++    if (s3tc < 0) {
++        s3tc = s3tc_srgb = rgtc = bptc = 0;
++        const char* force = getenv("MG_BC_DECODE");
++        GLint count = 0;
++        GLES.glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++        for (GLint i = 0; i < count && !(force && !strcmp(force, "1")); i++) {
++            const char* name = (const char*)GLES.glGetStringi(GL_EXTENSIONS, i);
++            if (!name) continue;
++            if (!strcmp(name, "GL_EXT_texture_compression_s3tc")) s3tc = 1;
++            else if (!strcmp(name, "GL_EXT_texture_compression_s3tc_srgb")) s3tc_srgb = 1;
++            else if (!strcmp(name, "GL_EXT_texture_compression_rgtc")) rgtc = 1;
++            else if (!strcmp(name, "GL_EXT_texture_compression_bptc")) bptc = 1;
++        }
++        GLint max_size = 0, fb_width = 0, fb_height = 0, renderbuffer = 0;
++        GLES.glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
++        GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH, &fb_width);
++        GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT, &fb_height);
++        GLES.glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &renderbuffer);
++        fprintf(stderr, "MobileGlues BC: S3TC %s, RGTC %s, BPTC %s (else decoded to RGBA8); textures up to %d, "
++                "framebuffers %dx%d, renderbuffers %d\n", s3tc ? "native" : "no", rgtc ? "native" : "no",
++                bptc ? "native" : "no", max_size, fb_width, fb_height, renderbuffer);
++    }
++    switch (format) {
++    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
++        return s3tc;
++    case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
++        return s3tc && s3tc_srgb;
++    case GL_COMPRESSED_RED_RGTC1:
++    case GL_COMPRESSED_SIGNED_RED_RGTC1:
++    case GL_COMPRESSED_RG_RGTC2:
++    case GL_COMPRESSED_SIGNED_RG_RGTC2:
++        return rgtc;
++    case GL_COMPRESSED_RGBA_BPTC_UNORM:
++    case GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
++    case GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT:
++    case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT:
++        return true;   // not decoded here: left to the driver
++    default:
++        return true;
++    }
++}
++
++// What a decoded [format] is stored as: one channel for BC4, two for BC5, three for BC1 without alpha, RGBA8 else.
++GLenum decoded_storage(GLenum format) {
++    switch (format) {
++    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
++        return GL_RGB8;
++    case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
++        return GL_SRGB8;
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
++        return GL_SRGB8_ALPHA8;
++    case GL_COMPRESSED_RED_RGTC1:
++    case GL_COMPRESSED_SIGNED_RED_RGTC1:
++        return GL_R8;
++    case GL_COMPRESSED_RG_RGTC2:
++    case GL_COMPRESSED_SIGNED_RG_RGTC2:
++        return GL_RG8;
++    default:
++        return GL_RGBA8;
++    }
++}
++
++// The client format and channel count that upload to a level stored as [internal].
++void upload_format(GLint internal, GLenum* format, int* channels) {
++    switch (internal) {
++    case GL_R8:
++    case GL_RED:
++        *format = GL_RED; *channels = 1; return;
++    case GL_RG8:
++    case GL_RG:
++        *format = GL_RG; *channels = 2; return;
++    case GL_RGB8:
++    case GL_SRGB8:
++    case GL_RGB:
++        *format = GL_RGB; *channels = 3; return;
++    default:
++        *format = GL_RGBA; *channels = 4; return;
++    }
++}
++
++GLint level_format(GLenum target, GLint level) {
++    GLint internal = 0;
++    GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_INTERNAL_FORMAT, &internal);
++    return internal;
++}
++
 +GLuint bound_2d() {
 +    GLint id = 0;
 +    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &id);
@@ -309,6 +409,54 @@ index 0000000..5caea56
 +    return true;
 +}
 +
++// [blocks], a [width]x[height] rectangle of [format], decoded into the bound texture's [level] at x, y, with the
++// unpack state and buffer of a plain client upload; whole when [whole], with RGBA8 storage.
++void upload_decoded(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
++                    const std::vector<uint8_t>& blocks, bool whole) {
++    Level l;
++    l.format = format;
++    l.width = width;
++    l.height = height;
++    std::vector<uint8_t> rgba;
++    if (!blocks.empty() && !decode(l, blocks, rgba)) return;
++    // Into the level as it's stored: a whole upload makes it, a part goes into what's there (MobileGlues makes an
++    // uncompressed texture of the game's BC4 and BC5 ones, R8 and RG8).
++    const GLenum storage = whole ? decoded_storage(format) : (GLenum)level_format(target, level);
++    GLenum client = GL_RGBA;
++    int channels = 4;
++    upload_format(storage, &client, &channels);
++    if (channels < 4 && !rgba.empty()) {
++        for (size_t i = 0, n = (size_t)width * height; i < n; i++)
++            for (int c = 0; c < channels; c++) rgba[i * channels + c] = rgba[i * 4 + c];
++        rgba.resize((size_t)width * height * channels);
++    }
++    GLint unpack = 0, row_length = 0, skip_rows = 0, skip_pixels = 0, alignment = 4;
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    GLES.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++    GLES.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++    GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    const void* pixels = rgba.empty() ? nullptr : rgba.data();
++    // So the error below is this upload's, not one an earlier call left.
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    if (whole) GLES.glTexImage2D(target, level, storage, width, height, 0, client, GL_UNSIGNED_BYTE, pixels);
++    else if (pixels) GLES.glTexSubImage2D(target, level, x, y, width, height, client, GL_UNSIGNED_BYTE, pixels);
++    GLenum error = GLES.glGetError();
++    if (error != GL_NO_ERROR)
++        fprintf(stderr, "MobileGlues BC: decoded upload %dx%d at %d,%d level %d of texture %u (stored as 0x%x): "
++                "GL error 0x%x\n", width, height, x, y, level, bound_2d(), storage, error);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
++    GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++    GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++}
++
 +} // namespace
 +
 +extern "C" {
@@ -316,7 +464,8 @@ index 0000000..5caea56
 +GLAPI GLAPIENTRY void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height,
 +                            GLint border, GLsizei imageSize, const void* data) {
 +    LOG()
-+    GLES.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
++    const bool decoded = target == GL_TEXTURE_2D && block_bytes(internalformat) && !native(internalformat);
++    if (!decoded) GLES.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 +    if (target != GL_TEXTURE_2D) return;
 +    GLuint texture = bound_2d();
 +    std::lock_guard<std::mutex> guard(lock);
@@ -329,15 +478,22 @@ index 0000000..5caea56
 +    l.width = width;
 +    l.height = height;
 +    allocate(l);
-+    source(data, imageSize, [&](const uint8_t* bytes) { write_blocks(l, 0, bytes, imageSize); });
++    std::vector<uint8_t> blocks;
++    source(data, imageSize, [&](const uint8_t* bytes) {
++        write_blocks(l, 0, bytes, imageSize);
++        if (decoded) blocks.assign(bytes, bytes + std::min((size_t)imageSize, l.size));
++    });
 +    shadows[{texture, level}] = std::move(l);
++    if (decoded) upload_decoded(target, level, 0, 0, width, height, internalformat, blocks, true);
 +}
 +
 +GLAPI GLAPIENTRY void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
 +                               GLsizei height, GLenum format, GLsizei imageSize, const void* data) {
 +    LOG()
-+    GLES.glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 +    const int bb = block_bytes(format);
++    const bool decoded = target == GL_TEXTURE_2D && bb &&
++                         (!native(format) || level_format(target, level) != (GLint)format);
++    if (!decoded) GLES.glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 +    if (target != GL_TEXTURE_2D || !bb) return;
 +    GLuint texture = bound_2d();
 +    std::lock_guard<std::mutex> guard(lock);
@@ -355,7 +511,9 @@ index 0000000..5caea56
 +    const int level_bw = (l.width + 3) / 4, bw = (width + 3) / 4, bh = (height + 3) / 4;
 +    const int bx = xoffset / 4, by = yoffset / 4;
 +    const size_t length = (size_t)bw * bb;
++    std::vector<uint8_t> copied;
 +    source(data, imageSize, [&](const uint8_t* blocks) {
++        if (decoded) copied.assign(blocks, blocks + std::min((size_t)imageSize, length * bh));
 +        // Whole rows are one run of blocks.
 +        if (bx == 0 && bw == level_bw) {
 +            write_blocks(l, (size_t)by * level_bw * bb, blocks, std::min((size_t)imageSize, length * bh));
@@ -364,6 +522,7 @@ index 0000000..5caea56
 +        for (int row = 0; row < bh && (size_t)(row + 1) * length <= (size_t)imageSize; row++)
 +            write_blocks(l, ((size_t)(by + row) * level_bw + bx) * bb, blocks + (size_t)row * length, length);
 +    });
++    if (decoded) upload_decoded(target, level, xoffset, yoffset, width, height, format, copied, false);
 +}
 +
 +GLAPI GLAPIENTRY void glGetCompressedTexImage(GLenum target, GLint level, void* img) {
@@ -376,6 +535,9 @@ index 0000000..5caea56
 +        fprintf(stderr, "MobileGlues BC read back: %dx%d level %d, compressed\n", found->second.width,
 +                found->second.height, level);
 +        sink(img, blocks.data(), blocks.size());
++    } else {
++        fprintf(stderr, "MobileGlues BC read back: texture %u level %d, compressed, but no copy of it\n", bound_2d(),
++                level);
 +    }
 +}
 +
@@ -385,17 +547,35 @@ index 0000000..5caea56
 +
 +// glGetTexLevelParameteriv's compressed pnames, which OpenGL ES lacks: true when answered here.
 +bool mg_bc_level_parameter(GLenum target, GLint level, GLenum pname, GLint* params) {
-+    if (pname != GL_TEXTURE_COMPRESSED_IMAGE_SIZE && pname != GL_TEXTURE_COMPRESSED) return false;
++    if (pname != GL_TEXTURE_COMPRESSED_IMAGE_SIZE && pname != GL_TEXTURE_COMPRESSED &&
++        pname != GL_TEXTURE_INTERNAL_FORMAT) return false;
 +    std::lock_guard<std::mutex> guard(lock);
 +    auto found = target == GL_TEXTURE_2D ? shadows.find({bound_2d(), level}) : shadows.end();
 +    const bool compressed = found != shadows.end();
++    // A decoded texture is RGBA8 to the driver and still what the game made it.
++    if (pname == GL_TEXTURE_INTERNAL_FORMAT) {
++        if (!compressed || native(found->second.format)) return false;
++        *params = (GLint)found->second.format;
++        return true;
++    }
 +    if (pname == GL_TEXTURE_COMPRESSED) *params = compressed ? GL_TRUE : GL_FALSE;
 +    else *params = compressed ? (GLint)found->second.size : 0;
++    fprintf(stderr, "MobileGlues BC: %s of texture %u level %d: %d\n",
++            pname == GL_TEXTURE_COMPRESSED ? "GL_TEXTURE_COMPRESSED" : "GL_TEXTURE_COMPRESSED_IMAGE_SIZE",
++            target == GL_TEXTURE_2D ? bound_2d() : 0, level, *params);
 +    return true;
 +}
 +
 +// glGetTexImage of a BC texture, decoded on the CPU: true when answered here.
 +bool mg_bc_get_tex_image(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {
++    {
++        GLint width = 0, height = 0;
++        GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &width);
++        GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &height);
++        fprintf(stderr, "MobileGlues read back: glGetTexImage target 0x%x texture %u level %d (%dx%d to the driver), "
++                "format 0x%x type 0x%x\n", target, target == GL_TEXTURE_2D ? bound_2d() : 0, level, width, height,
++                format, type);
++    }
 +    if (target != GL_TEXTURE_2D || type != GL_UNSIGNED_BYTE) return false;
 +    Level copy;
 +    std::vector<uint8_t> blocks;
@@ -437,6 +617,25 @@ index 0000000..5caea56
 +    for (GLsizei i = 0; i < n; i++)
 +        for (auto it = shadows.lower_bound({textures[i], -1}); it != shadows.end() && it->first.first == textures[i];)
 +            it = shadows.erase(it);
++}
++
++// glTexImage2D's formats: Factorio makes an empty BC atlas with glTexImage2D and fills it with
++// glCompressedTexSubImage2D. Where the driver lacks that BC format it's made uncompressed, in the channels the game
++// passes, and the fills decode into it.
++void mg_bc_image_format(GLint* internalformat, GLenum* format, GLenum* type, const void* pixels) {
++    if (!block_bytes(*internalformat) || native(*internalformat)) return;
++    switch (*format) {
++    case GL_RED: *internalformat = GL_R8; break;
++    case GL_RG: *internalformat = GL_RG8; break;
++    case GL_RGB: *internalformat = GL_RGB8; break;
++    default: *internalformat = GL_RGBA8; *format = GL_RGBA; break;
++    }
++    if (!pixels) *type = GL_UNSIGNED_BYTE;
++}
++
++// glTexStorage2D's format: uncompressed for a BC one the driver lacks, which the uploads decode into.
++void mg_bc_storage_format(GLenum* internalformat) {
++    if (block_bytes(*internalformat) && !native(*internalformat)) *internalformat = decoded_storage(*internalformat);
 +}
 +
 +void mg_bc_forget_level(GLenum target, GLint level) {
@@ -484,10 +683,10 @@ index 73aa3e9..0a4eb3f 100644
  STUB_FUNCTION_HEAD(void, glLoadTransposeMatrixdARB,const GLdouble* m); STUB_FUNCTION_END_NO_RETURN(void, glLoadTransposeMatrixdARB,m)
  STUB_FUNCTION_HEAD(void, glMultTransposeMatrixfARB,const GLfloat* m); STUB_FUNCTION_END_NO_RETURN(void, glMultTransposeMatrixfARB,m)
 diff --git a/MobileGlues-cpp/gl/texture.cpp b/MobileGlues-cpp/gl/texture.cpp
-index f4dd2f7..fbe1759 100644
+index f4dd2f7..a1271d6 100644
 --- a/MobileGlues-cpp/gl/texture.cpp
 +++ b/MobileGlues-cpp/gl/texture.cpp
-@@ -878,8 +878,14 @@ void glTexImage1D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+@@ -878,8 +878,17 @@ void glTexImage1D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
      CHECK_GL_ERROR
  }
  
@@ -496,13 +695,24 @@ index f4dd2f7..fbe1759 100644
 +extern "C" bool mg_bc_get_tex_image(GLenum, GLint, GLenum, GLenum, void*);
 +extern "C" void mg_bc_forget(GLsizei, const GLuint*);
 +extern "C" void mg_bc_forget_level(GLenum, GLint);
++extern "C" void mg_bc_storage_format(GLenum*);
++extern "C" void mg_bc_image_format(GLint*, GLenum*, GLenum*, const void*);
  void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
                    GLenum format, GLenum type, const GLvoid* pixels) {
 +    mg_bc_forget_level(target, level);
++    mg_bc_image_format(&internalFormat, &format, &type, pixels);
      LOG()
      LOG_D("mg_glTexImage2D,target: %s,level: %d,internalFormat: %s->%s,width: "
            "%d,height: %d,border: %d,format: %s,type: %s, pixels: 0x%x",
-@@ -1400,6 +1406,7 @@ void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat*
+@@ -1038,6 +1047,7 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat, GLsize
+           "%d, height: %d",
+           target, levels, internalFormat, width, height)
+ 
++    mg_bc_storage_format(&internalFormat);
+     internal_convert(&internalFormat, nullptr, nullptr, /*has_data=*/false);
+     GLES.glTexStorage2D(target, levels, internalFormat, width, height);
+ 
+@@ -1400,6 +1410,7 @@ void glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat*
  }
  
  void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* params) {
@@ -510,7 +720,7 @@ index f4dd2f7..fbe1759 100644
      LOG()
      LOG_D("glGetTexLevelParameteriv,target: %s, level: %d, pname: %s", glEnumToString(target), level,
            glEnumToString(pname))
-@@ -1558,6 +1565,7 @@ void glBindTexture(GLenum target, GLuint texture) {
+@@ -1558,6 +1569,7 @@ void glBindTexture(GLenum target, GLuint texture) {
  }
  
  void glDeleteTextures(GLsizei n, const GLuint* textures) {
@@ -518,7 +728,7 @@ index f4dd2f7..fbe1759 100644
      LOG()
      INIT_CHECK_GL_ERROR
      GLES.glDeleteTextures(n, textures);
-@@ -1617,6 +1625,7 @@ void glActiveTexture(GLenum texture) {
+@@ -1617,6 +1629,7 @@ void glActiveTexture(GLenum texture) {
  }
  
  void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {
@@ -526,3 +736,21 @@ index f4dd2f7..fbe1759 100644
      LOG()
      LOG_D("glGetTexImage, target: 0x%x, level: %d, format: 0x%x, type: 0x%x, pixels: 0x%x", target, level, format, type,
            pixels)
+@@ -1680,6 +1693,8 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void*
+     GLenum fboStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+     if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
+         LOG_E("glGetTexImage: Failed to create complete framebuffer. Status: 0x%x", fboStatus)
++        fprintf(stderr, "MobileGlues glGetTexImage: no complete framebuffer (0x%x) for texture %d level %d, %dx%d\n",
++                fboStatus, textureId, level, width, height);
+         // Overwhelmingly this is a depth or depth-stencil level: it is not
+         // colour-renderable, so hanging it off GL_COLOR_ATTACHMENT0 can never
+         // complete. A shadow-map readback used to land here and return in
+@@ -1701,6 +1716,8 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void*
+     if (!mg_readback_pair_supported(format, type)) {
+         LOG_E("glGetTexImage: %s + %s cannot be read back on this backend", glEnumToString(format),
+               glEnumToString(type))
++        fprintf(stderr, "MobileGlues glGetTexImage: format 0x%x type 0x%x can't be read back here (texture %d, %dx%d)\n",
++                format, type, textureId, width, height);
+         mg_set_gl_error(GL_INVALID_OPERATION);
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFBO);
