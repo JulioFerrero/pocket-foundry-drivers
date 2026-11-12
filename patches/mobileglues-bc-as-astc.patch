@@ -1,0 +1,1217 @@
+diff --git a/MobileGlues-cpp/CMakeLists.txt b/MobileGlues-cpp/CMakeLists.txt
+index e33ba6d..f2dda4b 100644
+--- a/MobileGlues-cpp/CMakeLists.txt
++++ b/MobileGlues-cpp/CMakeLists.txt
+@@ -99,6 +99,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
+     gl/framebuffer.cpp
+     gl/texture.cpp
+     gl/bc_shadow.cpp
++    gl/bc_astc.cpp
+     gl/drawing.cpp
+     gl/multidraw.cpp
+     bench/multidraw_bench.cpp
+diff --git a/MobileGlues-cpp/gl/bc_astc.cpp b/MobileGlues-cpp/gl/bc_astc.cpp
+new file mode 100644
+index 0000000..45fb698
+--- /dev/null
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -0,0 +1,447 @@
++// Pocket Foundry patch for MobileGlues (LGPL-2.1): BC1-BC3 textures kept as ASTC 4x4 where OpenGL ES has ASTC and no
++// BC (Mali, PowerVR). A compute shader decodes each BC block as bc_shadow.cpp's CPU decoder does and encodes it again
++// with the ASTC encoder of taowen/libhybris' Vulkan compat layer (bc_astc_encoder.inc, MIT), which keeps BC1-BC3
++// colour almost exactly: 8 bits a texel, where the RGBA8 that bc_shadow.cpp decodes into otherwise takes 32.
++#include "../includes.h"
++#include <GL/gl.h>
++#include "glcorearb.h"
++#include "log.h"
++#include "../gles/loader.h"
++#include "mg.h"
++#include "bc_astc.h"
++#include "../egl/context.h"
++#include <cstdio>
++#include <cstring>
++#include <atomic>
++#include <map>
++#include <mutex>
++#include <vector>
++#include <string>
++
++#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
++#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
++#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
++#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
++#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
++#endif
++#ifndef GL_COMPRESSED_SRGB_S3TC_DXT1_EXT
++#define GL_COMPRESSED_SRGB_S3TC_DXT1_EXT 0x8C4C
++#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT 0x8C4D
++#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT 0x8C4E
++#define GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT 0x8C4F
++#endif
++#ifndef GL_COMPRESSED_RGBA_ASTC_4x4_KHR
++#define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
++#define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR 0x93D0
++#endif
++
++namespace {
++
++#include "bc_astc_encoder.inc"
++
++// One invocation a 4x4 block. u_kind: BC1 without alpha (0) or with (1), BC2 (2), BC3 (3), or none (4): an empty
++// level, transparent black, where an ASTC block of zeros would be the decoder's error colour.
++const char kHeader[] = R"GLSL(#version 310 es
++precision highp float;
++precision highp int;
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(std430, binding = 0) readonly buffer Src { uint w[]; } src;
++layout(std430, binding = 1) writeonly buffer Dst { uvec4 b[]; } dst;
++layout(location = 0) uniform uvec2 u_blocks;
++layout(location = 1) uniform uint u_kind;
++layout(location = 2) uniform uint u_src;   /* the job's first word in src */
++layout(location = 3) uniform uint u_dst;   /* and its first block in dst */
++const uint BC_QUALITY = 1u;
++ivec4 g_px[16];
++)GLSL";
++
++const char kDecoder[] = R"GLSL(
++ivec3 rgb565(uint c)
++{
++    ivec3 v = ivec3(int((c >> 11) & 31u), int((c >> 5) & 63u), int(c & 31u));
++    return ivec3((v.r << 3) | (v.r >> 2), (v.g << 2) | (v.g >> 4), (v.b << 3) | (v.b >> 2));
++}
++
++/* bc_shadow.cpp's bc1(): four colours, or three and black, transparent unless rgb */
++void colour(uint c01, uint indices, bool four, bool rgb)
++{
++    uint c0 = c01 & 0xffffu, c1 = c01 >> 16;
++    ivec3 a = rgb565(c0), b = rgb565(c1);
++    ivec4 p[4];
++    p[0] = ivec4(a, 255);
++    p[1] = ivec4(b, 255);
++    if (four || c0 > c1) {
++        p[2] = ivec4((2 * a + b) / 3, 255);
++        p[3] = ivec4((a + 2 * b) / 3, 255);
++    } else {
++        p[2] = ivec4((a + b) / 2, 255);
++        p[3] = ivec4(0, 0, 0, rgb ? 255 : 0);
++    }
++    for (uint t = 0u; t < 16u; t++) g_px[t] = p[(indices >> (2u * t)) & 3u];
++}
++
++void alpha_bc2(uint w0, uint w1)
++{
++    for (uint t = 0u; t < 16u; t++)
++        g_px[t].a = int(((t < 8u ? w0 >> (4u * t) : w1 >> (4u * (t - 8u))) & 15u) * 17u);
++}
++
++/* bc_shadow.cpp's bc4(), into alpha: 3-bit indices from bit 16 of the 64-bit block */
++void alpha_bc3(uint w0, uint w1)
++{
++    int a0 = int(w0 & 0xffu), a1 = int((w0 >> 8) & 0xffu);
++    int p[8];
++    p[0] = a0;
++    p[1] = a1;
++    if (a0 > a1) {
++        for (int k = 1; k <= 6; k++) p[k + 1] = ((7 - k) * a0 + k * a1) / 7;
++    } else {
++        for (int k = 1; k <= 4; k++) p[k + 1] = ((5 - k) * a0 + k * a1) / 5;
++        p[6] = 0;
++        p[7] = 255;
++    }
++    for (uint t = 0u; t < 16u; t++) {
++        uint at = 16u + 3u * t;
++        uint v = at >= 32u ? w1 >> (at - 32u) : (w0 >> at) | (at > 29u ? w1 << (32u - at) : 0u);
++        g_px[t].a = p[v & 7u];
++    }
++}
++
++void main()
++{
++    uvec2 at = gl_GlobalInvocationID.xy;
++    if (at.x >= u_blocks.x || at.y >= u_blocks.y) return;
++    uint i = at.y * u_blocks.x + at.x;
++    if (u_kind == 4u) {
++        dst.b[u_dst + i] = uvec4(0xfffffdfcu, 0xffffffffu, 0u, 0u);
++        return;
++    }
++    /* Copied out first: Mali's compiler refuses a read-only buffer's words as function arguments ("Function call
++     * discards 'readonly' access qualifier"). */
++    if (u_kind < 2u) {
++        uint s = u_src + 2u * i;
++        uint c01 = src.w[s], indices = src.w[s + 1u];
++        colour(c01, indices, false, u_kind == 0u);
++    } else {
++        uint s = u_src + 4u * i;
++        uint a0 = src.w[s], a1 = src.w[s + 1u], c01 = src.w[s + 2u], indices = src.w[s + 3u];
++        colour(c01, indices, true, true);
++        if (u_kind == 2u) alpha_bc2(a0, a1);
++        else alpha_bc3(a0, a1);
++    }
++    dst.b[u_dst + i] = astc_encode(~0u, false);
++}
++)GLSL";
++
++unsigned kind_of(GLenum bc) {
++    switch (bc) {
++    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
++        return 0;
++    case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
++        return 1;
++    case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
++        return 2;
++    default:
++        return 3;
++    }
++}
++
++// One upload: [src_word] and [dst_block] are where its blocks are in the encoder's buffers.
++struct Job {
++    GLuint texture;
++    GLenum target, astc;
++    GLint level, x, y;
++    GLsizei width, height;
++    unsigned kind;
++    GLuint bw, bh;
++    size_t src_word, dst_block;
++    bool whole;
++};
++
++struct Encoder {
++    int ready = -1;   // -1: not tried yet
++    GLuint program = 0, in = 0, out = 0;
++    // Uploads waiting for a batch: an upload from a buffer the GPU still writes waits for the GPU, 1.7 ms each on an
++    // Adreno 830, and building the atlases makes 35,000 small ones (60 s). Run before anything can use them.
++    std::mutex queue_lock;
++    std::vector<uint8_t> staged;
++    std::vector<Job> jobs;
++    size_t blocks = 0;
++};
++// A program and buffers belong to the contexts of one share group: made in the one MobileGlues starts in, they
++// weren't the game's (its dispatches failed with GL_INVALID_OPERATION).
++std::map<unsigned long long, Encoder> encoders;   // a std::map: an entry stays where it is as others come
++std::mutex encoders_lock;
++size_t encoded = 0, reported = 0;
++std::atomic<int> queued{0};   // jobs waiting, in every encoder
++
++Encoder& current() {
++    std::lock_guard<std::mutex> guard(encoders_lock);
++    return encoders[g_current_ctx && g_current_ctx->share_group ? g_current_ctx->share_group->id : 0];
++}
++
++bool has_astc() {
++    GLint major = 0, minor = 0;
++    GLES.glGetIntegerv(GL_MAJOR_VERSION, &major);
++    GLES.glGetIntegerv(GL_MINOR_VERSION, &minor);
++    if (major < 3 || (major == 3 && minor < 1)) return false;   // no compute shaders
++    if (major > 3 || minor >= 2) return true;                  // ASTC LDR is part of OpenGL ES 3.2
++    GLint count = 0;
++    GLES.glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++    for (GLint i = 0; i < count; i++) {
++        const char* name = (const char*)GLES.glGetStringi(GL_EXTENSIONS, i);
++        if (name && !strcmp(name, "GL_KHR_texture_compression_astc_ldr")) return true;
++    }
++    return false;
++}
++
++bool build(Encoder& encoder) {
++    if (!has_astc()) {
++        fprintf(stderr, "MobileGlues BC: no ASTC or no compute shaders, so BC is decoded to RGBA8\n");
++        return false;
++    }
++    const std::string source = std::string(kHeader) + kAstcEncoder + kDecoder;
++    const char* text = source.c_str();
++    GLuint shader = GLES.glCreateShader(GL_COMPUTE_SHADER);
++    GLES.glShaderSource(shader, 1, &text, nullptr);
++    GLES.glCompileShader(shader);
++    GLint ok = 0;
++    GLES.glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    char log[2048] = "";
++    if (!ok) {
++        GLES.glGetShaderInfoLog(shader, sizeof log, nullptr, log);
++        fprintf(stderr, "MobileGlues BC: the ASTC encoder didn't compile, so BC is decoded to RGBA8: %s\n", log);
++        GLES.glDeleteShader(shader);
++        return false;
++    }
++    GLuint program = GLES.glCreateProgram();
++    GLES.glAttachShader(program, shader);
++    GLES.glLinkProgram(program);
++    GLES.glDeleteShader(shader);
++    GLES.glGetProgramiv(program, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        GLES.glGetProgramInfoLog(program, sizeof log, nullptr, log);
++        fprintf(stderr, "MobileGlues BC: the ASTC encoder didn't link, so BC is decoded to RGBA8: %s\n", log);
++        GLES.glDeleteProgram(program);
++        return false;
++    }
++    encoder.program = program;
++    GLES.glGenBuffers(1, &encoder.in);
++    GLES.glGenBuffers(1, &encoder.out);
++    static bool said = false;
++    if (!said) fprintf(stderr, "MobileGlues BC: BC1-BC3 kept as ASTC 4x4, encoded on the GPU\n");
++    said = true;
++    return true;
++}
++
++} // namespace
++
++GLenum mg_astc_for(GLenum bc) {
++    switch (bc) {
++    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
++        return GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
++    case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
++    case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
++        return GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR;
++    default:
++        return 0;
++    }
++}
++
++bool mg_astc_ready() {
++    Encoder& encoder = current();
++    if (encoder.ready < 0) encoder.ready = build(encoder);
++    return encoder.ready;
++}
++
++namespace {
++
++// [jobs]' blocks, [staged], to the GPU, a dispatch each, then each into its texture: one wait for the GPU for all.
++void run(const Encoder& encoder, const std::vector<Job>& jobs, const uint8_t* staged, size_t staged_bytes,
++         size_t blocks) {
++    // The game's state, put back after.
++    GLint program = 0, unpack = 0, storage = 0, texture = 0, bound[2] = {};
++    GLint64 start[2] = {}, length[2] = {};
++    GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    GLES.glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &storage);
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    for (GLuint i = 0; i < 2; i++) {
++        GLES.glGetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING, i, &bound[i]);
++        GLES.glGetInteger64i_v(GL_SHADER_STORAGE_BUFFER_START, i, &start[i]);
++        GLES.glGetInteger64i_v(GL_SHADER_STORAGE_BUFFER_SIZE, i, &length[i]);
++    }
++    // So the errors below are these uploads'.
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++
++    GLES.glBindBuffer(GL_SHADER_STORAGE_BUFFER, encoder.in);
++    // Empty levels only: nothing to read, but a storage buffer can't be bound with no size.
++    const bool empty = !staged || staged_bytes == 0;
++    GLES.glBufferData(GL_SHADER_STORAGE_BUFFER, empty ? 16 : (GLsizeiptr)staged_bytes, empty ? nullptr : staged,
++                      GL_STREAM_DRAW);
++    GLES.glBindBuffer(GL_SHADER_STORAGE_BUFFER, encoder.out);
++    GLES.glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(blocks * 16), nullptr, GL_STREAM_COPY);
++    GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, encoder.in);
++    GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, encoder.out);
++    GLES.glUseProgram(encoder.program);
++    for (const Job& job : jobs) {
++        GLES.glUniform2ui(0, job.bw, job.bh);
++        GLES.glUniform1ui(1, job.kind);
++        GLES.glUniform1ui(2, (GLuint)job.src_word);
++        GLES.glUniform1ui(3, (GLuint)job.dst_block);
++        GLES.glDispatchCompute((job.bw + 7) / 8, (job.bh + 7) / 8, 1);
++    }
++    GLES.glMemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
++
++    // The game's bindings back before the uploads: an Adreno refuses (GL_INVALID_OPERATION) a compressed upload from
++    // a buffer that's still bound as a storage buffer.
++    GLES.glUseProgram((GLuint)program);
++    for (GLuint i = 0; i < 2; i++) {
++        if (length[i] > 0) GLES.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, i, (GLuint)bound[i], start[i], length[i]);
++        else GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, (GLuint)bound[i]);
++    }
++    GLES.glBindBuffer(GL_SHADER_STORAGE_BUFFER, (GLuint)storage);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, encoder.out);
++    GLuint bound_texture = (GLuint)texture;
++    size_t failed = 0;
++    for (const Job& job : jobs) {
++        if (job.texture != bound_texture) GLES.glBindTexture(GL_TEXTURE_2D, bound_texture = job.texture);
++        const GLsizei size = (GLsizei)job.bw * (GLsizei)job.bh * 16;
++        const void* offset = (const void*)(job.dst_block * 16);
++        if (job.whole)
++            GLES.glCompressedTexImage2D(job.target, job.level, job.astc, job.width, job.height, 0, size, offset);
++        else
++            GLES.glCompressedTexSubImage2D(job.target, job.level, job.x, job.y, job.width, job.height, job.astc, size,
++                                           offset);
++        const GLenum error = GLES.glGetError();
++        if (error != GL_NO_ERROR && failed++ < 3)
++            fprintf(stderr, "MobileGlues BC: ASTC upload %dx%d at %d,%d level %d of texture %u: GL error 0x%x\n",
++                    job.width, job.height, job.x, job.y, job.level, job.texture, error);
++        if (error == GL_NO_ERROR) encoded += size;
++    }
++    if (bound_texture != (GLuint)texture) GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++    if (encoded - reported >= (64u << 20)) {
++        reported = encoded;
++        fprintf(stderr, "MobileGlues BC: %zu MB of ASTC so far\n", encoded >> 20);
++    }
++}
++
++void flush(Encoder& encoder) {
++    if (encoder.jobs.empty()) return;
++    run(encoder, encoder.jobs, encoder.staged.data(), encoder.staged.size(), encoder.blocks);
++    queued -= (int)encoder.jobs.size();
++    encoder.jobs.clear();
++    encoder.staged.clear();
++    encoder.blocks = 0;
++}
++
++} // namespace
++
++bool mg_astc_upload(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum bc,
++                    const uint8_t* blocks, size_t size, bool whole) {
++    const GLenum astc = mg_astc_for(bc);
++    const unsigned kind = blocks ? kind_of(bc) : 4;
++    const GLuint bw = (GLuint)(width + 3) / 4, bh = (GLuint)(height + 3) / 4;
++    const size_t in_bytes = blocks ? (size_t)bw * bh * (kind < 2 ? 8 : 16) : 0;
++    if (!astc || !mg_astc_ready() || (blocks && size < in_bytes)) return false;
++    Encoder& encoder = current();
++    GLint texture = 0;
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    std::lock_guard<std::mutex> guard(encoder.queue_lock);
++    Job job{(GLuint)texture, target, astc, level, x, y, width, height, kind, bw, bh, 0, 0, whole};
++    if (whole) {
++        // A level made, or remade. What's waiting for it goes first. The level is made now, its blocks come with the
++        // batch: Factorio makes some 3,000 while loading, and each made at once waited for the GPU. Where the driver
++        // won't make an ASTC level without data, it's made at once, and the caller learns whether that worked.
++        for (const Job& queued_job : encoder.jobs) {
++            if (queued_job.texture == job.texture && queued_job.level == level) {
++                flush(encoder);
++                break;
++            }
++        }
++        GLint unpack = 0;
++        GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++        if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++        while (GLES.glGetError() != GL_NO_ERROR) {}
++        GLES.glCompressedTexImage2D(target, level, astc, width, height, 0, (GLsizei)((size_t)bw * bh * 16), nullptr);
++        const bool made = GLES.glGetError() == GL_NO_ERROR;
++        if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++        if (!made) {
++            const size_t before = encoded;
++            run(encoder, {job}, blocks, in_bytes, (size_t)bw * bh);
++            return encoded > before;
++        }
++        job.whole = false;
++    }
++    job.src_word = encoder.staged.size() / 4;
++    job.dst_block = encoder.blocks;
++    encoder.staged.insert(encoder.staged.end(), blocks, blocks + in_bytes);
++    encoder.blocks += (size_t)bw * bh;
++    encoder.jobs.push_back(job);
++    queued++;
++    if (encoder.staged.size() >= (16u << 20) || encoder.jobs.size() >= 4096) flush(encoder);
++    return true;
++}
++
++void mg_astc_flush() {
++    if (queued.load() == 0) return;
++    Encoder& encoder = current();
++    std::lock_guard<std::mutex> guard(encoder.queue_lock);
++    flush(encoder);
++}
++
++void mg_astc_flush_for(GLuint texture, GLint level) {
++    if (queued.load() == 0) return;
++    Encoder& encoder = current();
++    std::lock_guard<std::mutex> guard(encoder.queue_lock);
++    for (const Job& job : encoder.jobs) {
++        if (job.texture == texture && (level < 0 || job.level == level)) {
++            flush(encoder);
++            return;
++        }
++    }
++}
++
++// Draws, dispatches and glFinish, which MobileGlues hands straight to the driver: the waiting uploads first. Not
++// glFlush: Factorio's sprite loader flushes after each upload, and the queue runs before the next draw anyway; there,
++// every upload was a batch of its own that waited for the GPU (1,622 of them loading the atlases from the cache).
++extern "C" {
++GLAPI GLAPIENTRY void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
++    mg_astc_flush();
++    GLES.glDrawArrays(mode, first, count);
++}
++
++GLAPI GLAPIENTRY void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
++    mg_astc_flush();
++    GLES.glDrawArraysInstanced(mode, first, count, instancecount);
++}
++
++GLAPI GLAPIENTRY void glDrawArraysIndirect(GLenum mode, const void* indirect) {
++    mg_astc_flush();
++    GLES.glDrawArraysIndirect(mode, indirect);
++}
++
++GLAPI GLAPIENTRY void glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
++    mg_astc_flush();
++    GLES.glDrawElementsIndirect(mode, type, indirect);
++}
++
++GLAPI GLAPIENTRY void glDispatchComputeIndirect(GLintptr indirect) {
++    mg_astc_flush();
++    GLES.glDispatchComputeIndirect(indirect);
++}
++
++GLAPI GLAPIENTRY void glFinish() {
++    mg_astc_flush();
++    GLES.glFinish();
++}
++}
+diff --git a/MobileGlues-cpp/gl/bc_astc.h b/MobileGlues-cpp/gl/bc_astc.h
+new file mode 100644
+index 0000000..c84f023
+--- /dev/null
++++ b/MobileGlues-cpp/gl/bc_astc.h
+@@ -0,0 +1,27 @@
++// Pocket Foundry patch for MobileGlues (LGPL-2.1): BC1-BC3 kept as ASTC 4x4 (bc_astc.cpp).
++#ifndef MOBILEGLUES_BC_ASTC_H
++#define MOBILEGLUES_BC_ASTC_H
++
++#include <GLES3/gl32.h>
++#include <cstddef>
++#include <cstdint>
++
++// The ASTC 4x4 format BC1, BC2 or BC3 [bc] is kept as, else 0.
++GLenum mg_astc_for(GLenum bc);
++
++// Whether this thread's context can: OpenGL ES 3.1's compute shaders, ASTC, and the encoder built.
++bool mg_astc_ready();
++
++// [blocks] (size bytes), [width]x[height] texels of [bc], encoded on the GPU into the bound texture's [level] with the
++// next batch: at x, y, or the whole level when [whole], which is made at once. No blocks: an empty level, transparent.
++// False when it couldn't.
++bool mg_astc_upload(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum bc,
++                    const uint8_t* blocks, size_t size, bool whole);
++
++// The uploads waiting for a batch, done: before anything can draw with or read their textures.
++void mg_astc_flush();
++
++// The same, only if some are for [texture]'s [level] (any level when negative): before it's remade or deleted.
++void mg_astc_flush_for(GLuint texture, GLint level);
++
++#endif
+diff --git a/MobileGlues-cpp/gl/bc_astc_encoder.inc b/MobileGlues-cpp/gl/bc_astc_encoder.inc
+new file mode 100644
+index 0000000..097b630
+--- /dev/null
++++ b/MobileGlues-cpp/gl/bc_astc_encoder.inc
+@@ -0,0 +1,427 @@
++// The ASTC 4x4 encoder of taowen/libhybris's Vulkan compat layer (hybris/vulkan/compat/shaders/astc_enc.glsl at
++// 226b247d90adcb5eb1b120885fac8b96063726ee), MIT as its own header says, without its BC7 partition table, which only
++// BC7 uses. bc_astc.cpp puts it into its compute shader.
++static const char kAstcEncoder[] = R"GLSL(
++/* ASTC 4x4 LDR block encoder for the Mali bridge's BC transcoding (bc_decode.comp, ENC_ASTC).
++ *
++ * Ported to GLSL from astc_enc.slang and astc_pack.slang of leegao/etc2_encode (commit a32883c;
++ * "Realtime rgba8 -> astc/etc2/etc1 encoder as a compute shader"), whose licence follows. Kept from
++ * it: endpoints from the principal axis (power iteration on the covariance), the blue-contraction
++ * swap, the block mode and BISE packing. Changed: float32 instead of half
++ * arithmetic; weights picked by the error against the quantized endpoints as a decoder expands
++ * them; one least-squares refit of the endpoints to those weights; up to two weight / endpoint
++ * precisions tried per block, the second only when the first is not good enough (2-bit weights with
++ * 8-bit endpoints keep BC1/BC3 colour almost exactly), for blocks with alpha a second weight plane
++ * for alpha, and for BC7 blocks of 2 or 3 subsets 2 partitions with the ASTC partition nearest
++ * BC7's (from a 256-entry table instead of upstream's k-means and 48 KB lookup); the lowest error
++ * is kept. A block of one colour is a void-extent block. BC_QUALITY 0 (fast): no refit, a shorter
++ * power iteration, a second candidate only for a poor block, and BC7's 1-partition blocks one
++ * candidate; 2 (high): every candidate, and BC7's 2-partition blocks 1 partition too.
++ *
++ * MIT License
++ *
++ * Copyright (c) 2026 Lee Gao
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * Input: g_px[16] (row-major texels, 8-bit RGBA). Output: the 128-bit block, little-endian words.
++ */
++
++/* Candidates (4x4 weights; bits: 17 header, 2 more for the plane selector, 29 with 2 partitions):
++ *   CEM 8 (RGB):   2-bit weights + 8-bit endpoints (32 + 48), 3-bit + 8-bit (48 + 48), 4-bit + QUANT_192 (64 + 46)
++ *   CEM 12 (RGBA): 3-bit + QUANT_192 (48 + 61), 4-bit + QUANT_48 (64 + 45),
++ *                  dual plane (alpha its own) 2-bit + QUANT_48 (64 + 45 + 2)
++ *   2 partitions, CEM 8: 2-bit weights + QUANT_40 endpoints (32 + 64), where the block was a BC7 block
++ *                  of 2 or 3 subsets: the ASTC partition closest to BC7's (gen_astc_tables.py).
++ * The endpoint range is not the encoder's to choose: a decoder takes the largest that fits the bits
++ * the weights leave. */
++
++
++uint g_apart; /* texels (bit t) in partition 1 */
++
++bool astc_in(uint p, uint part) { return ((g_apart >> p) & 1u) == part; }
++
++/* Rank r (by decoded value) of endpoint range q (40, 48, 192, 256): ISE value, decoded value. A trit
++ * or quint range's lower half has the low bit clear and its upper half mirrors it; the decoded value
++ * is the specification's unquantization (T = D * C + B, inverted by the low bit). */
++uvec2 astc_rank(uint q, uint r)
++{
++    if (q == 256u) return uvec2(r, r);
++    bool up = r >= (q >> 1);
++    uint rr = up ? q - 1u - r : r;
++    /* trit / quint, the bits above the low one (rr / 5 or rr / 3 by multiplication; rr < 96) */
++    uint h = q == 40u ? (rr * 52429u) >> 18 : (rr * 43691u) >> 17, t = rr - h * (q == 40u ? 5u : 3u);
++    uint nb, B, C;
++    if (q == 192u) { nb = 6u; B = (h << 4) | (h >> 4); C = 5u; }
++    else if (q == 48u) { nb = 4u; B = (h << 6) | h; C = 22u; }
++    else { nb = 3u; B = (h << 7) | (h << 1) | (h >> 1); C = 26u; }
++    uint T = t * C + B;
++    if (up) T ^= 0x1ffu;
++    return uvec2((t << nb) | (h << 1) | (up ? 1u : 0u), (up ? 0x80u : 0u) | (T >> 2));
++}
++
++/* The nearest endpoint value of range q: ISE value, decoded value. */
++uvec2 astc_ep(uint q, float v)
++{
++    v = clamp(v, 0.0, 255.0);
++    if (q == 256u) {
++        uint u = uint(v + 0.5);
++        return uvec2(u, u);
++    }
++    uint n = q - 1u, r = uint(v * float(n) / 255.0 + 0.5);
++    /* the decoded values grow with the rank and lie within a step of uniform: the nearest is r or its
++     * neighbour on v's side */
++    uvec2 e = astc_rank(q, r);
++    uint r2 = float(e.y) < v ? min(r + 1u, n) : (r > 0u ? r - 1u : 0u);
++    uvec2 e2 = astc_rank(q, r2);
++    return abs(float(e2.y) - v) < abs(float(e.y) - v) ? e2 : e;
++}
++
++/* Weight value (0..64) of index k in a b-bit weight range (bit replication). */
++float astc_w(uint b, uint k)
++{
++    uint w = b == 2u ? k * 21u : (b == 3u ? k * 9u : (k << 2) | (k >> 2));
++    return float(w > 32u ? w + 1u : w);
++}
++
++/* The line through partition part's texels (channels in m) along their principal axis, ends at the
++ * extremes. */
++void astc_line(vec4 m, uint part, out vec4 lo, out vec4 hi)
++{
++    vec4 c = vec4(0.0), mn = vec4(255.0), mx = vec4(0.0);
++    float n = 0.0;
++    for (uint p = 0u; p < 16u; p++) {
++        if (!astc_in(p, part)) continue;
++        vec4 v = vec4(g_px[p]);
++        c += v;
++        mn = min(mn, v);
++        mx = max(mx, v);
++        n += 1.0;
++    }
++    c /= max(n, 1.0);
++    mat4 cov = mat4(0.0);
++    for (uint p = 0u; p < 16u; p++) {
++        if (!astc_in(p, part)) continue;
++        vec4 d = (vec4(g_px[p]) - c) * m;
++        cov += outerProduct(d, d);
++    }
++    vec4 ax = (mx - mn) * m;
++    lo = c;
++    hi = c;
++    if (dot(ax, ax) < 1e-4) return;
++    for (int i = 0; i < (BC_QUALITY == 0u ? 2 : 6); i++) {
++        vec4 nx = cov * ax;
++        float l = dot(nx, nx);
++        if (l < 1e-12) break;
++        ax = nx * inversesqrt(l);
++    }
++    ax = normalize(ax);
++    float t0 = 1e9, t1 = -1e9;
++    for (uint p = 0u; p < 16u; p++) {
++        if (!astc_in(p, part)) continue;
++        float t = dot((vec4(g_px[p]) - c) * m, ax);
++        t0 = min(t0, t);
++        t1 = max(t1, t);
++    }
++    lo = clamp(c + ax * t0, 0.0, 255.0);
++    hi = clamp(c + ax * t1, 0.0, 255.0);
++}
++
++void astc_put(inout uvec4 b, uint pos, uint n, uint v)
++{
++    v &= (1u << n) - 1u;
++    uint w = pos >> 5, o = pos & 31u;
++    b[w] |= v << o;
++    if (o + n > 32u) b[w + 1u] |= v >> (32u - o);
++}
++
++/* 5 trits as the 8 bits T of the specification's integer sequence encoding, 3 quints as its 7 bits
++ * Q (its decoding procedures inverted; where bits are free they are 0). */
++uint astc_trits(uint t0, uint t1, uint t2, uint t3, uint t4)
++{
++    uint c = t2 == 2u ? (t1 == 2u ? 12u | t0 : (t1 << 4) | (t0 << 2) | 3u) : (t2 << 4) | (t1 << 2) | t0;
++    if (t3 == 2u && t4 == 2u) return ((c >> 2) << 5) | 0x1cu | (c & 3u);
++    return t4 == 2u ? (t3 << 7) | 0x60u | c : (t4 << 7) | (t3 << 5) | c;
++}
++
++uint astc_quints(uint q0, uint q1, uint q2)
++{
++    if (q1 == 4u && q0 == 4u) return 6u | (q2 == 4u ? 1u : ((q2 >> 1) << 4) | ((q2 & 1u) << 3));
++    uint c = q1 == 4u ? (q0 << 3) | 5u : (q1 << 3) | q0;
++    return q2 == 4u ? (c & 0x18u) | ((~(c >> 1) & 3u) << 5) | 6u | (c & 1u) : (q2 << 5) | c;
++}
++
++/* Endpoints in BISE: 8 bits each, quints (QUANT_40: 3 bits) in groups of 3, or trits (QUANT_48:
++ * 4 bits, QUANT_192: 6 bits) in groups of 5, each value's bits followed by its share of the group's
++ * Q (3, 2, 2 bits) or T (2, 2, 1, 2, 1). */
++uint astc_ise(inout uvec4 b, uint pos, uint q, uint v[16], uint n)
++{
++    if (q == 256u) {
++        for (uint i = 0u; i < n; i++) astc_put(b, pos + 8u * i, 8u, v[i]);
++        return pos + 8u * n;
++    }
++    uint nb = q == 40u ? 3u : (q == 48u ? 4u : 6u), gs = q == 40u ? 3u : 5u;
++    for (uint g = 0u; g < n; g += gs) {
++        uint x[5];
++        for (uint j = 0u; j < 5u; j++) x[j] = g + j < n ? v[g + j] >> nb : 0u;
++        uint tq = q == 40u ? astc_quints(x[0], x[1], x[2]) : astc_trits(x[0], x[1], x[2], x[3], x[4]);
++        for (uint j = 0u; j < gs && g + j < n; j++) {
++            astc_put(b, pos, nb, v[g + j]);
++            pos += nb;
++            uint k = q == 40u ? (j == 0u ? 3u : 2u) : (j == 2u || j == 4u ? 1u : 2u);
++            uint sh = q == 40u ? (j == 0u ? 0u : 2u * j + 1u) : 2u * j - (j >= 3u ? 1u : 0u);
++            astc_put(b, pos, k, tq >> sh);
++            pos += k;
++        }
++    }
++    return pos;
++}
++
++/* The level of a b-bit weight range nearest t (0..1): the levels lie within half a step of uniform,
++ * so it is the rounded index or its neighbour on t's side. */
++uint astc_wq(uint b, float t)
++{
++    uint n = (1u << b) - 1u, k = uint(clamp(t, 0.0, 1.0) * float(n) + 0.5);
++    float wk = astc_w(b, k);
++    t *= 64.0;
++    uint k2 = wk < t ? min(k + 1u, n) : (k > 0u ? k - 1u : 0u);
++    return abs(astc_w(b, k2) - t) < abs(wk - t) ? k2 : k;
++}
++
++/* n bits of v at bit pos of a 64-bit field. */
++void astc_put64(inout uvec2 w, uint pos, uint n, uint v)
++{
++    if (pos >= 32u) {
++        w.y |= v << (pos - 32u);
++    } else {
++        w.x |= v << pos;
++        if (pos + n > 32u) w.y |= v >> (32u - pos);
++    }
++}
++
++/* Weights for decoded endpoints d0, d1 per partition (plane 0 over the channels in m, plane 1 alpha
++ * when dual): the error of the block and the weight indices in wi (in texel order, interleaved by
++ * plane when dual: at most 64 bits). A texel's error is quadratic in the weight along the
++ * endpoints' line, so its best level is the one nearest its projection on the line. Also, in r0 /
++ * r1, the endpoints refitted to those weights by least squares (d0 / d1 where that is singular). */
++float astc_weights(vec4 d0[2], vec4 d1[2], vec4 m, bool dual, uint wb, out uvec2 wi, out vec4 r0[2], out vec4 r1[2])
++{
++    float e = 0.0;
++    vec4 rest = vec4(1.0) - m;
++    if (dual) rest.a = 0.0;
++    vec4 ax[2], s0[2], s1[2];
++    float sa[2], sb[2], sc[2];
++    for (uint k = 0u; k < 2u; k++) {
++        ax[k] = (d1[k] - d0[k]) * m;
++        float l = dot(ax[k], ax[k]);
++        ax[k] *= l > 0.0 ? 1.0 / l : 0.0;
++        s0[k] = s1[k] = vec4(0.0);
++        sa[k] = sb[k] = sc[k] = 0.0;
++    }
++    float ra = d1[0].a - d0[0].a;
++    ra = ra != 0.0 ? 1.0 / ra : 0.0;
++    vec4 al = vec4(0.0); /* dual: alpha's sums (y * y, y * x, x * x, y * a), x * a in a1 */
++    float a1 = 0.0;
++    wi = uvec2(0u);
++    uint pos = 0u;
++    for (uint p = 0u; p < 16u; p++) {
++        uint part = (g_apart >> p) & 1u;
++        vec4 v = vec4(g_px[p]), a = d0[part], b = d1[part];
++        uint k = astc_wq(wb, dot((v - a) * m, ax[part]));
++        float x = astc_w(wb, k) / 64.0, y = 1.0 - x;
++        vec4 d = (v - mix(a, b, x)) * m + (v - a) * rest;
++        e += dot(d, d);
++        sa[part] += y * y;
++        sb[part] += y * x;
++        sc[part] += x * x;
++        s0[part] += y * v;
++        s1[part] += x * v;
++        astc_put64(wi, pos, wb, k);
++        pos += wb;
++        if (dual) {
++            uint ka = astc_wq(wb, (v.a - a.a) * ra);
++            float xa = astc_w(wb, ka) / 64.0, ya = 1.0 - xa;
++            float da = v.a - mix(a.a, b.a, xa);
++            e += da * da;
++            al += vec4(ya * ya, ya * xa, xa * xa, ya * v.a);
++            a1 += xa * v.a;
++            astc_put64(wi, pos, wb, ka);
++            pos += wb;
++        }
++    }
++    for (uint k = 0u; k < 2u; k++) {
++        r0[k] = d0[k];
++        r1[k] = d1[k];
++        float det = sa[k] * sc[k] - sb[k] * sb[k];
++        if (abs(det) < 1e-3) continue;
++        r0[k] = mix(r0[k], clamp((sc[k] * s0[k] - sb[k] * s1[k]) / det, 0.0, 255.0), m);
++        r1[k] = mix(r1[k], clamp((sa[k] * s1[k] - sb[k] * s0[k]) / det, 0.0, 255.0), m);
++    }
++    float det = al.x * al.z - al.y * al.y;
++    if (dual && abs(det) >= 1e-3) {
++        r0[0].a = clamp((al.z * al.w - al.y * a1) / det, 0.0, 255.0);
++        r1[0].a = clamp((al.x * a1 - al.y * al.w) / det, 0.0, 255.0);
++    }
++    return e;
++}
++
++/* One candidate from endpoints l0, l1 per partition (a principal axis' extremes; with dual, alpha's
++ * extremes in .a): the lower of its error and limit (the best error so far), and its block in blk
++ * where it is the lower. seed: the partition seed with 2 partitions (g_apart set), else ~0u. */
++float astc_try(bool rgba, bool dual, uint wb, uint q, uint seed, vec4 l0[2], vec4 l1[2], float limit, inout uvec4 blk)
++{
++    vec4 m = rgba && !dual ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0);
++    bool two = seed != ~0u;
++    uint np = two ? 2u : 1u;
++    vec4 e0[2], e1[2];
++    for (uint k = 0u; k < 2u; k++) {
++        e0[k] = l0[k];
++        e1[k] = l1[k];
++        if (!rgba) e0[k].a = e1[k].a = 255.0;
++    }
++    uint nv = rgba ? 8u : 6u;
++    float best = limit;
++    for (int pass = 0; pass < 2; pass++) {
++        uint v[16];
++        vec4 d0[2], d1[2];
++        for (uint k = 0u; k < np; k++) {
++            for (uint c = 0u; c < 4u; c++) {
++                uvec2 a = astc_ep(q, e0[k][c]), b = astc_ep(q, e1[k][c]);
++                v[k * nv + 2u * c] = a.x;
++                if (2u * c + 1u < nv) v[k * nv + 2u * c + 1u] = b.x;
++                d0[k][c] = float(a.y);
++                d1[k][c] = float(b.y);
++            }
++            if (!rgba) d0[k].a = d1[k].a = 255.0;
++            /* A decoder blue-contracts endpoints whose second colour sums lower: swap them. */
++            if (d1[k].r + d1[k].g + d1[k].b < d0[k].r + d0[k].g + d0[k].b) {
++                vec4 t = d0[k]; d0[k] = d1[k]; d1[k] = t;
++                for (uint c = 0u; 2u * c < nv; c++) {
++                    uint x = v[k * nv + 2u * c];
++                    v[k * nv + 2u * c] = v[k * nv + 2u * c + 1u];
++                    v[k * nv + 2u * c + 1u] = x;
++                }
++            }
++        }
++        if (!two) { d0[1] = d0[0]; d1[1] = d1[0]; }
++        uvec2 wi;
++        float e = astc_weights(d0, d1, m, dual, wb, wi, e0, e1);
++        if (e < best) {
++            best = e;
++            /* block mode: 4x4 weights (A = 2, B = 0), range R/H, D for the second plane */
++            uint r = wb == 2u ? 4u : (wb == 3u ? 7u : 4u), h = wb == 4u ? 1u : 0u;
++            uint bm = ((r >> 1) & 3u) | ((r & 1u) << 4) | (2u << 5) | (h << 9) | ((dual ? 1u : 0u) << 10);
++            uvec4 b = uvec4(0u);
++            astc_put(b, 0u, 11u, bm);
++            if (two) {
++                astc_put(b, 11u, 2u, 1u);
++                astc_put(b, 13u, 10u, seed);
++                astc_put(b, 25u, 4u, rgba ? 12u : 8u); /* bits 23-24 zero: every partition this CEM */
++                astc_ise(b, 29u, q, v, 2u * nv);
++            } else {
++                astc_put(b, 13u, 4u, rgba ? 12u : 8u);
++                astc_ise(b, 17u, q, v, nv);
++            }
++            if (dual) astc_put(b, 128u - 64u - 2u, 2u, 3u); /* plane 2 is alpha (after 64 weight bits) */
++            /* weights run from the top of the block down */
++            blk = b | uvec4(0u, 0u, bitfieldReverse(wi.y), bitfieldReverse(wi.x));
++        }
++        if (pass == 0 && (e == 0.0 || BC_QUALITY == 0u)) break;
++        /* pass 1: the endpoints refitted to pass 0's weights (e0 / e1) */
++    }
++    return best;
++}
++
++/* A block error (squared differences summed over the texels' channels, 8-bit units) good enough to
++ * stop at: about 0.7 a texel, under a decoder's own rounding. */
++const float ASTC_GOOD = 8.0;
++
++/* The error past which the next candidate is tried: fast, about 2 a texel; high, any. */
++float astc_good() { return BC_QUALITY == 0u ? 64.0 : (BC_QUALITY == 1u ? ASTC_GOOD : -1.0); }
++
++/* part: for a BC7 block of 2 or 3 subsets, its entry in ASTC_BC7P (seed << 16 | partition-1
++ * texels), else ~0u. fine: BC7 (BC2 / BC3 colour is BC1's: 4 shades on a 5:6:5 line, which 2-bit
++ * weights and 8-bit endpoints keep almost exactly).
++ *
++ * Candidates are tried from the one that wins most on such content, until one is good enough; on
++ * bcn_check's images (photo, rough, gradient, soft alpha) each of the others won on few blocks or by
++ * a small margin. Without alpha: BC2 / BC3 2-bit weights and 8-bit endpoints, then 4-bit weights
++ * and QUANT_192; BC7 3-bit and 8-bit, then 4-bit and QUANT_192, or for a BC7 block of 2 or 3 subsets
++ * its 2 partitions first and 4-bit weights only after. With alpha: 3-bit weights and QUANT_192, then
++ * for BC2 / BC3 a second plane for alpha (2-bit, QUANT_48: their alpha seldom follows the colour),
++ * for BC7 4-bit weights and QUANT_48 (high: then a second plane as well). */
++uvec4 astc_encode(uint part, bool fine)
++{
++    bool alpha = false, same = true;
++    for (uint p = 0u; p < 16u; p++) {
++        alpha = alpha || g_px[p].a != 255;
++        same = same && g_px[p] == g_px[0];
++    }
++    if (same) {
++        /* one colour: a void-extent block, the colour in UNORM16 */
++        uvec4 c = uvec4(g_px[0]) * 257u;
++        return uvec4(0xfffffdfcu, 0xffffffffu, c.r | (c.g << 16), c.b | (c.a << 16));
++    }
++    g_apart = 0u;
++    vec4 s0[2], s1[2]; /* one partition: the line over the colour (with alpha when that varies) */
++    astc_line(alpha ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0), 0u, s0[0], s1[0]);
++    s0[1] = s0[0];
++    s1[1] = s1[0];
++    uvec4 blk = uvec4(0u);
++    float e;
++    if (alpha) {
++        e = astc_try(true, false, 3u, 192u, ~0u, s0, s1, 1e30, blk);
++        if (e <= astc_good()) return blk;
++        if (fine) {
++            e = astc_try(true, false, 4u, 48u, ~0u, s0, s1, e, blk);
++            if (BC_QUALITY < 2u) return blk;
++        }
++        /* dual plane: the colour's own line, alpha from its extremes */
++        vec4 d0[2], d1[2];
++        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, d0[0], d1[0]);
++        float amin = 255.0, amax = 0.0;
++        for (uint p = 0u; p < 16u; p++) {
++            amin = min(amin, float(g_px[p].a));
++            amax = max(amax, float(g_px[p].a));
++        }
++        d0[0].a = amin;
++        d1[0].a = amax;
++        d0[1] = d0[0];
++        d1[1] = d1[0];
++        astc_try(true, true, 2u, 48u, ~0u, d0, d1, e, blk);
++        return blk;
++    }
++    if (part != ~0u) {
++        g_apart = part & 0xffffu;
++        vec4 p0[2], p1[2];
++        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 0u, p0[0], p1[0]);
++        astc_line(vec4(1.0, 1.0, 1.0, 0.0), 1u, p0[1], p1[1]);
++        e = astc_try(false, false, 2u, 40u, part >> 16, p0, p1, 1e30, blk);
++        g_apart = 0u;
++        if (BC_QUALITY == 2u) e = astc_try(false, false, 3u, 256u, ~0u, s0, s1, e, blk);
++    } else if (fine && BC_QUALITY == 0u) {
++        astc_try(false, false, 4u, 192u, ~0u, s0, s1, 1e30, blk); /* the usual winner on BC7 */
++        return blk;
++    } else {
++        e = fine ? astc_try(false, false, 3u, 256u, ~0u, s0, s1, 1e30, blk) : astc_try(false, false, 2u, 256u, ~0u, s0, s1, 1e30, blk);
++    }
++    if (e > astc_good()) astc_try(false, false, 4u, 192u, ~0u, s0, s1, e, blk);
++    return blk;
++}
++)GLSL";
+diff --git a/MobileGlues-cpp/gl/bc_shadow.cpp b/MobileGlues-cpp/gl/bc_shadow.cpp
+index 184f795..fa5c246 100644
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -4,8 +4,10 @@
+ // compressor that way at every start. This keeps a CPU copy of every BC upload to 2D textures and answers from it:
+ // the bytes as they were uploaded, and RGBA8 decoded on the CPU (BC1-BC5). The copies live in a deleted file in
+ // MG_DIR_PATH, not in memory: a game's whole set of atlases is gigabytes, read back once if at all.
+-// Where OpenGL ES has no BC (Mali), the texture is RGBA8 and every BC upload is decoded into it: Factorio makes its
+-// mipmapped atlas BC whatever its settings say. MG_BC_DECODE=1 decodes on every GPU, to test that.
++// Where OpenGL ES has no BC (Mali, PowerVR), BC1-BC3 textures are ASTC 4x4, encoded on the GPU (bc_astc.cpp), and
++// the others, or all of them without ASTC, are uncompressed with every BC upload decoded into them: Factorio makes its
++// mipmapped atlas BC whatever its settings say. MG_BC_DECODE=1 decodes on every GPU, and MG_BC_DECODE=astc takes the
++// ASTC way on every GPU, to test them.
+ #include "../includes.h"
+ #include <GL/gl.h>
+ #include "glcorearb.h"
+@@ -13,6 +15,7 @@
+ #include "../gles/loader.h"
+ #include "mg.h"
+ #include <GLES3/gl32.h>
++#include "bc_astc.h"
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstdio>
+@@ -166,7 +169,7 @@ bool native(GLenum format) {
+         const char* force = getenv("MG_BC_DECODE");
+         GLint count = 0;
+         GLES.glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+-        for (GLint i = 0; i < count && !(force && !strcmp(force, "1")); i++) {
++        for (GLint i = 0; i < count && !(force && (!strcmp(force, "1") || !strcmp(force, "astc"))); i++) {
+             const char* name = (const char*)GLES.glGetStringi(GL_EXTENSIONS, i);
+             if (!name) continue;
+             if (!strcmp(name, "GL_EXT_texture_compression_s3tc")) s3tc = 1;
+@@ -179,7 +182,7 @@ bool native(GLenum format) {
+         GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH, &fb_width);
+         GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT, &fb_height);
+         GLES.glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &renderbuffer);
+-        fprintf(stderr, "MobileGlues BC: S3TC %s, RGTC %s, BPTC %s (else decoded to RGBA8); textures up to %d, "
++        fprintf(stderr, "MobileGlues BC: S3TC %s, RGTC %s, BPTC %s (else ASTC or decoded); textures up to %d, "
+                 "framebuffers %dx%d, renderbuffers %d\n", s3tc ? "native" : "no", rgtc ? "native" : "no",
+                 bptc ? "native" : "no", max_size, fb_width, fb_height, renderbuffer);
+     }
+@@ -209,6 +212,15 @@ bool native(GLenum format) {
+     }
+ }
+ 
++// The ASTC 4x4 that a BC [format] the driver lacks is kept as, else 0: decoded.
++GLenum astc_storage(GLenum format) {
++    if (native(format)) return 0;
++    const char* force = getenv("MG_BC_DECODE");
++    if (force && !strcmp(force, "1")) return 0;
++    const GLenum astc = mg_astc_for(format);
++    return astc && mg_astc_ready() ? astc : 0;
++}
++
+ // What a decoded [format] is stored as: one channel for BC4, two for BC5, three for BC1 without alpha, RGBA8 else.
+ GLenum decoded_storage(GLenum format) {
+     switch (format) {
+@@ -439,8 +451,10 @@ extern "C" {
+ GLAPI GLAPIENTRY void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height,
+                             GLint border, GLsizei imageSize, const void* data) {
+     LOG()
+-    const bool decoded = target == GL_TEXTURE_2D && block_bytes(internalformat) && !native(internalformat);
+-    if (!decoded) GLES.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
++    const GLenum astc = target == GL_TEXTURE_2D && block_bytes(internalformat) ? astc_storage(internalformat) : 0;
++    const bool decoded = !astc && target == GL_TEXTURE_2D && block_bytes(internalformat) && !native(internalformat);
++    if (!decoded && !astc)
++        GLES.glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+     if (target != GL_TEXTURE_2D) return;
+     GLuint texture = bound_2d();
+     std::lock_guard<std::mutex> guard(lock);
+@@ -456,19 +470,25 @@ GLAPI GLAPIENTRY void glCompressedTexImage2D(GLenum target, GLint level, GLenum
+     std::vector<uint8_t> blocks;
+     source(data, imageSize, [&](const uint8_t* bytes) {
+         write_blocks(l, 0, bytes, imageSize);
+-        if (decoded) blocks.assign(bytes, bytes + std::min((size_t)imageSize, l.size));
++        if (decoded || astc) blocks.assign(bytes, bytes + std::min((size_t)imageSize, l.size));
+     });
+     shadows[{texture, level}] = std::move(l);
+-    if (decoded) upload_decoded(target, level, 0, 0, width, height, internalformat, blocks, true);
++    // Without ASTC after all, the level is made uncompressed, and its later uploads decode into it.
++    const uint8_t* bytes = blocks.empty() ? nullptr : blocks.data();
++    if (astc && mg_astc_upload(target, level, 0, 0, width, height, internalformat, bytes, blocks.size(), true)) return;
++    if (decoded || astc) upload_decoded(target, level, 0, 0, width, height, internalformat, blocks, true);
+ }
+ 
+ GLAPI GLAPIENTRY void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+                                GLsizei height, GLenum format, GLsizei imageSize, const void* data) {
+     LOG()
+     const int bb = block_bytes(format);
+-    const bool decoded = target == GL_TEXTURE_2D && bb &&
+-                         (!native(format) || level_format(target, level) != (GLint)format);
+-    if (!decoded) GLES.glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
++    const GLint stored = target == GL_TEXTURE_2D && bb ? level_format(target, level) : 0;
++    const bool astc =
++        target == GL_TEXTURE_2D && bb && !native(format) && stored && stored == (GLint)mg_astc_for(format);
++    const bool decoded = target == GL_TEXTURE_2D && bb && !astc && (!native(format) || stored != (GLint)format);
++    if (!decoded && !astc)
++        GLES.glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
+     if (target != GL_TEXTURE_2D || !bb) return;
+     GLuint texture = bound_2d();
+     std::lock_guard<std::mutex> guard(lock);
+@@ -488,7 +508,7 @@ GLAPI GLAPIENTRY void glCompressedTexSubImage2D(GLenum target, GLint level, GLin
+     const size_t length = (size_t)bw * bb;
+     std::vector<uint8_t> copied;
+     source(data, imageSize, [&](const uint8_t* blocks) {
+-        if (decoded) copied.assign(blocks, blocks + std::min((size_t)imageSize, length * bh));
++        if (decoded || astc) copied.assign(blocks, blocks + std::min((size_t)imageSize, length * bh));
+         // Whole rows are one run of blocks.
+         if (bx == 0 && bw == level_bw) {
+             write_blocks(l, (size_t)by * level_bw * bb, blocks, std::min((size_t)imageSize, length * bh));
+@@ -497,7 +517,10 @@ GLAPI GLAPIENTRY void glCompressedTexSubImage2D(GLenum target, GLint level, GLin
+         for (int row = 0; row < bh && (size_t)(row + 1) * length <= (size_t)imageSize; row++)
+             write_blocks(l, ((size_t)(by + row) * level_bw + bx) * bb, blocks + (size_t)row * length, length);
+     });
+-    if (decoded) upload_decoded(target, level, xoffset, yoffset, width, height, format, copied, false);
++    if (astc && !copied.empty())
++        mg_astc_upload(target, level, xoffset, yoffset, width, height, format, copied.data(), copied.size(), false);
++    else if (decoded)
++        upload_decoded(target, level, xoffset, yoffset, width, height, format, copied, false);
+ }
+ 
+ GLAPI GLAPIENTRY void glGetCompressedTexImage(GLenum target, GLint level, void* img) {
+@@ -588,6 +611,7 @@ bool mg_bc_get_tex_image(GLenum target, GLint level, GLenum format, GLenum type,
+ }
+ 
+ void mg_bc_forget(GLsizei n, const GLuint* textures) {
++    for (GLsizei i = 0; i < n; i++) mg_astc_flush_for(textures[i], -1);
+     std::lock_guard<std::mutex> guard(lock);
+     for (GLsizei i = 0; i < n; i++)
+         for (auto it = shadows.lower_bound({textures[i], -1}); it != shadows.end() && it->first.first == textures[i];)
+@@ -608,12 +632,32 @@ void mg_bc_image_format(GLint* internalformat, GLenum* format, GLenum* type, con
+     if (!pixels) *type = GL_UNSIGNED_BYTE;
+ }
+ 
+-// glTexStorage2D's format: uncompressed for a BC one the driver lacks, which the uploads decode into.
++// Whether the game is told it has S3TC: OpenGL ES has it, or BC1-BC3 are kept as ASTC. Decoded to RGBA8, the game
++// would only spend its time compressing.
++bool mg_bc_s3tc() {
++    return native(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT) || astc_storage(GL_COMPRESSED_RGBA_S3TC_DXT5_EXT);
++}
++
++// glTexStorage2D's format: for a BC one the driver lacks, ASTC or uncompressed, which the uploads go into.
+ void mg_bc_storage_format(GLenum* internalformat) {
+-    if (block_bytes(*internalformat) && !native(*internalformat)) *internalformat = decoded_storage(*internalformat);
++    if (!block_bytes(*internalformat) || native(*internalformat)) return;
++    const GLenum astc = astc_storage(*internalformat);
++    *internalformat = astc ? astc : decoded_storage(*internalformat);
++}
++
++// glTexImage2D of an empty level of a BC format [requested] that's kept as ASTC: made here, transparent. False leaves
++// the level to the driver, as mg_bc_image_format made it.
++bool mg_bc_compressed_image(GLenum target, GLint level, GLint requested, GLsizei width, GLsizei height,
++                            const void* pixels) {
++    if (target != GL_TEXTURE_2D || pixels || !block_bytes(requested) || !astc_storage(requested)) return false;
++    GLint unpack = 0;
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    if (unpack) return false;   // pixels is an offset into it: not empty
++    return mg_astc_upload(target, level, 0, 0, width, height, requested, nullptr, 0, true);
+ }
+ 
+ void mg_bc_forget_level(GLenum target, GLint level) {
++    if (target == GL_TEXTURE_2D) mg_astc_flush_for(bound_2d(), level);
+     if (target != GL_TEXTURE_2D) return;
+     std::lock_guard<std::mutex> guard(lock);
+     shadows.erase({bound_2d(), level});
+diff --git a/MobileGlues-cpp/gl/drawing.cpp b/MobileGlues-cpp/gl/drawing.cpp
+index d3c9619..113ddd4 100644
+--- a/MobileGlues-cpp/gl/drawing.cpp
++++ b/MobileGlues-cpp/gl/drawing.cpp
+@@ -6,6 +6,7 @@
+ // End of Source File Header
+ 
+ #include "drawing.h"
++#include "bc_astc.h"
+ #include "restart.h"
+ #include "buffer.h"
+ #include "framebuffer.h"
+@@ -194,6 +195,7 @@ void setupBufferTextureUniforms(GLuint program) {
+ }
+ 
+ void prepareForDraw() {
++    mg_astc_flush();
+     LOG_D("prepareForDraw...")
+     if (hardware->emulate_texture_buffer) {
+         setupBufferTextureUniforms(gl_state->current_program);
+@@ -245,6 +247,7 @@ void glDispatchCompute(GLuint num_groups_x, GLuint num_groups_y, GLuint num_grou
+     LOG()
+     LOG_D("glDispatchCompute, num_groups_x: %d, num_groups_y: %d, num_groups_z: %d", num_groups_x, num_groups_y,
+           num_groups_z)
++    mg_astc_flush();
+     GLES.glDispatchCompute(num_groups_x, num_groups_y, num_groups_z);
+     CHECK_GL_ERROR
+ }
+diff --git a/MobileGlues-cpp/gl/gl_native.cpp b/MobileGlues-cpp/gl/gl_native.cpp
+index 853ec77..f11902d 100644
+--- a/MobileGlues-cpp/gl/gl_native.cpp
++++ b/MobileGlues-cpp/gl/gl_native.cpp
+@@ -55,11 +55,11 @@ NATIVE_FUNCTION_HEAD(void, glDepthRangef, GLfloat n, GLfloat f) NATIVE_FUNCTION_
+ NATIVE_FUNCTION_HEAD(void, glDetachShader, GLuint program, GLuint shader) NATIVE_FUNCTION_END_NO_RETURN(void, glDetachShader, program,shader)
+ // NATIVE_FUNCTION_HEAD(void, glDisable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glDisable, cap)   // moved to gl/enable.cpp (virtual enable state table)
+ NATIVE_FUNCTION_HEAD(void, glDisableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glDisableVertexAttribArray, index)
+-NATIVE_FUNCTION_HEAD(void, glDrawArrays, GLenum mode, GLint first, GLsizei count) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArrays, mode,first,count)
++//NATIVE_FUNCTION_HEAD(void, glDrawArrays, GLenum mode, GLint first, GLsizei count) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArrays, mode,first,count)
+ //NATIVE_FUNCTION_HEAD(void, glDrawElements, GLenum mode, GLsizei count, GLenum type, const void *indices) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElements, mode,count,type,indices)
+ // NATIVE_FUNCTION_HEAD(void, glEnable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glEnable, cap)   // moved to gl/enable.cpp (virtual enable state table)
+ NATIVE_FUNCTION_HEAD(void, glEnableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glEnableVertexAttribArray, index)
+-NATIVE_FUNCTION_HEAD(void, glFinish) NATIVE_FUNCTION_END_NO_RETURN(void, glFinish)
++//NATIVE_FUNCTION_HEAD(void, glFinish) NATIVE_FUNCTION_END_NO_RETURN(void, glFinish)
+ NATIVE_FUNCTION_HEAD(void, glFlush) NATIVE_FUNCTION_END_NO_RETURN(void, glFlush)
+ // NATIVE_FUNCTION_HEAD(void, glFramebufferRenderbuffer, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) NATIVE_FUNCTION_END_NO_RETURN(void, glFramebufferRenderbuffer, target,attachment,renderbuffertarget,renderbuffer)   // implemented in gl/framebuffer.cpp
+ //NATIVE_FUNCTION_HEAD(void, glFramebufferTexture2D, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) NATIVE_FUNCTION_END_NO_RETURN(void, glFramebufferTexture2D, target,attachment,textarget,texture,level)
+@@ -222,7 +222,7 @@ NATIVE_FUNCTION_HEAD(GLuint, glGetUniformBlockIndex, GLuint program, const GLcha
+ NATIVE_FUNCTION_HEAD(void, glGetActiveUniformBlockiv, GLuint program, GLuint uniformBlockIndex, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformBlockiv, program,uniformBlockIndex,pname,params)
+ NATIVE_FUNCTION_HEAD(void, glGetActiveUniformBlockName, GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei *length, GLchar *uniformBlockName) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformBlockName, program,uniformBlockIndex,bufSize,length,uniformBlockName)
+ NATIVE_FUNCTION_HEAD(void, glUniformBlockBinding, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) NATIVE_FUNCTION_END_NO_RETURN(void, glUniformBlockBinding, program,uniformBlockIndex,uniformBlockBinding)
+-NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysInstanced, mode,first,count,instancecount)
++//NATIVE_FUNCTION_HEAD(void, glDrawArraysInstanced, GLenum mode, GLint first, GLsizei count, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysInstanced, mode,first,count,instancecount)
+ // NATIVE_FUNCTION_HEAD(void, glDrawElementsInstanced, GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElementsInstanced, mode,count,type,indices,instancecount)
+ NATIVE_FUNCTION_HEAD(GLsync, glFenceSync, GLenum condition, GLbitfield flags) NATIVE_FUNCTION_END(GLsync, glFenceSync, condition,flags)
+ NATIVE_FUNCTION_HEAD(GLboolean, glIsSync, GLsync sync) NATIVE_FUNCTION_END(GLboolean, glIsSync, sync)
+@@ -259,9 +259,9 @@ NATIVE_FUNCTION_HEAD(void, glInvalidateSubFramebuffer, GLenum target, GLsizei nu
+ //NATIVE_FUNCTION_HEAD(void, glTexStorage3D, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth) NATIVE_FUNCTION_END_NO_RETURN(void, glTexStorage3D, target,levels,internalformat,width,height,depth)
+ NATIVE_FUNCTION_HEAD(void, glGetInternalformativ, GLenum target, GLenum internalformat, GLenum pname, GLsizei bufSize, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetInternalformativ, target,internalformat,pname,bufSize,params)
+ //NATIVE_FUNCTION_HEAD(void, glDispatchCompute, GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z) NATIVE_FUNCTION_END_NO_RETURN(void, glDispatchCompute, num_groups_x,num_groups_y,num_groups_z)
+-NATIVE_FUNCTION_HEAD(void, glDispatchComputeIndirect, GLintptr indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDispatchComputeIndirect, indirect)
+-NATIVE_FUNCTION_HEAD(void, glDrawArraysIndirect, GLenum mode, const void *indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysIndirect, mode,indirect)
+-NATIVE_FUNCTION_HEAD(void, glDrawElementsIndirect, GLenum mode, GLenum type, const void *indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElementsIndirect, mode,type,indirect)
++//NATIVE_FUNCTION_HEAD(void, glDispatchComputeIndirect, GLintptr indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDispatchComputeIndirect, indirect)
++//NATIVE_FUNCTION_HEAD(void, glDrawArraysIndirect, GLenum mode, const void *indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArraysIndirect, mode,indirect)
++//NATIVE_FUNCTION_HEAD(void, glDrawElementsIndirect, GLenum mode, GLenum type, const void *indirect) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElementsIndirect, mode,type,indirect)
+ NATIVE_FUNCTION_HEAD(void, glFramebufferParameteri, GLenum target, GLenum pname, GLint param) NATIVE_FUNCTION_END_NO_RETURN(void, glFramebufferParameteri, target,pname,param)
+ NATIVE_FUNCTION_HEAD(void, glGetFramebufferParameteriv, GLenum target, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetFramebufferParameteriv, target,pname,params)
+ NATIVE_FUNCTION_HEAD(void, glGetProgramInterfaceiv, GLuint program, GLenum programInterface, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetProgramInterfaceiv, program,programInterface,pname,params)
+diff --git a/MobileGlues-cpp/gl/texture.cpp b/MobileGlues-cpp/gl/texture.cpp
+index a1271d6..126ee46 100644
+--- a/MobileGlues-cpp/gl/texture.cpp
++++ b/MobileGlues-cpp/gl/texture.cpp
+@@ -885,9 +885,11 @@ extern "C" void mg_bc_forget(GLsizei, const GLuint*);
+ extern "C" void mg_bc_forget_level(GLenum, GLint);
+ extern "C" void mg_bc_storage_format(GLenum*);
+ extern "C" void mg_bc_image_format(GLint*, GLenum*, GLenum*, const void*);
++extern "C" bool mg_bc_compressed_image(GLenum, GLint, GLint, GLsizei, GLsizei, const void*);
+ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid* pixels) {
+     mg_bc_forget_level(target, level);
++    const GLint requested = internalFormat;
+     mg_bc_image_format(&internalFormat, &format, &type, pixels);
+     LOG()
+     LOG_D("mg_glTexImage2D,target: %s,level: %d,internalFormat: %s->%s,width: "
+@@ -953,7 +955,9 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei widt
+ 
+     tex->format = format;
+ 
+-    GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
++    // An empty BC level kept as ASTC is made there (bc_shadow.cpp).
++    if (!mg_bc_compressed_image(target, level, requested, width, height, pixels))
++        GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
+ 
+     CHECK_GL_ERROR
+ }
+diff --git a/MobileGlues-cpp/gles/loader.cpp b/MobileGlues-cpp/gles/loader.cpp
+index 94593bd..30ea373 100644
+--- a/MobileGlues-cpp/gles/loader.cpp
++++ b/MobileGlues-cpp/gles/loader.cpp
+@@ -196,6 +196,8 @@ void LogOpenGLExtensions() {
+ 
+ struct gles_caps_t g_gles_caps;
+ 
++extern "C" bool mg_bc_s3tc();
++
+ void InitGLESCapabilities() {
+     memset(&g_gles_caps, 0, sizeof(struct gles_caps_t));
+ 
+@@ -296,6 +298,10 @@ void InitGLESCapabilities() {
+     if (g_gles_caps.major > 3 || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1)) {
+         AppendExtension("GL_ARB_vertex_attrib_binding");
+     }
++
++    // Pocket Foundry: S3TC where BC textures work (gl/bc_shadow.cpp). Without it Factorio leaves its atlases
++    // uncompressed, four times the memory.
++    if (mg_bc_s3tc()) AppendExtension("GL_EXT_texture_compression_s3tc");
+ }
+ 
+ void init_target_gles() {
