@@ -44,8 +44,10 @@ jobs:
         run: build/runtime.sh out
       - name: Build ${{ matrix.driver }}
         run: |
+          script=driver.sh
+          [ "$(jq -r .kind drivers/${{ matrix.driver }}.json)" = gles ] && script=gles.sh
           docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out" pocketfoundry-build \
-              bash /repo/build/driver.sh /repo/drivers/${{ matrix.driver }}.json /out /out/runtime-libs.txt
+              bash /repo/build/$script /repo/drivers/${{ matrix.driver }}.json /out /out/runtime-libs.txt
       - uses: actions/upload-artifact@v7
         with:
           name: driver-${{ matrix.driver }}

@@ -1,0 +1,51 @@
+{
+  "name": "MobileGlues",
+  "kind": "gles",
+  "testing": true,
+  "version": "2.0.0",
+  "about": "The phone's own OpenGL ES driver, without Zink or Vulkan: MobileGL-Dev's MobileGlues, made for Minecraft, turns the game's OpenGL into it, through libhybris.",
+  "madeBy": "MobileGL-Dev",
+  "licence": "LGPL-2.1",
+  "for": "Any GPU",
+  "priority": 9,
+  "source": {
+    "git": "https://github.com/MobileGL-Dev/MobileGlues",
+    "ref": "97558a69157b033b890958b1e49258c5b51a80c6"
+  },
+  "build": {
+    "packages": [
+      "libvulkan-dev",
+      "libx11-dev",
+      "libxcb1-dev",
+      "libxcb-dri3-dev",
+      "libxcb-present-dev"
+    ],
+    "prepare": [
+      "git submodule update --init --depth 1 MobileGlues-cpp/3rdparty/glslang MobileGlues-cpp/3rdparty/SPIRV-Cross MobileGlues-cpp/3rdparty/xxhash MobileGlues-cpp/include/ska"
+    ],
+    "cmake": "MobileGlues-cpp",
+    "patches": [
+      "patches/mobileglues-libraries-by-path.patch",
+      "patches/mobileglues-bc-read-back.patch"
+    ],
+    "licences": [
+      "LICENSE",
+      "MobileGlues-cpp/3rdparty/glslang/LICENSE.txt",
+      "MobileGlues-cpp/3rdparty/SPIRV-Cross/LICENSE",
+      "MobileGlues-cpp/3rdparty/xxhash/LICENSE",
+      "MobileGlues-cpp/include/ska/LICENSE"
+    ]
+  },
+  "tested": [
+    {
+      "phone": "vivo X200 Ultra",
+      "gpu": "Adreno 830",
+      "android": 16,
+      "version": "2.0.0",
+      "result": "plays",
+      "fps": "59",
+      "app": "0.8.18-beta.2",
+      "date": "2026-11-12"
+    }
+  ]
+}
