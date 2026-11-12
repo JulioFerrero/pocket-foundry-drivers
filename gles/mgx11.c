@@ -77,6 +77,7 @@ struct window_surface {
     unsigned textures[3], framebuffers[3];
     uint32_t pixmaps[3];
     unsigned next_buffer;
+    unsigned stride;
     /* A frame goes to the X server once the GPU has drawn it, a frame later, so the CPU and GPU overlap. */
     void *fences[3];
     int waiting;   /* the buffer drawn last frame, -1 if none */
@@ -254,6 +255,8 @@ typedef struct {
 } AHardwareBuffer_Desc;
 /* The X server reads the buffer as its own BGRA. */
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
+#define AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN 3ULL
+#define AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN (3ULL << 4)
 #define AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE (1ULL << 8)
 #define AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER (1ULL << 9)
 #define EGL_NATIVE_BUFFER_ANDROID 0x3140
@@ -394,13 +397,19 @@ static int make_buffers(struct window_surface *s)
     hw.get_integer(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
     int made = 1;
     for (int i = 0; i < 3 && made; i++) {
+        /* The X server copies a frame it doesn't flip with the CPU: for the GPU only, Mali's allocator compresses
+         * the buffer (AFBC) and the copy showed its tiles as noise on a Mali-G52, and Google's on PowerVR refuses
+         * the lock (as with the app's own Vulkan swapchain, runtime/hybris/patches/0006). CPU access makes them
+         * plain pixels. */
         AHardwareBuffer_Desc desc = {(uint32_t)s->width, (uint32_t)s->height, 1, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
-                                     AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER,
+                                     AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+                                         AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
                                      0, 0, 0};
         AHardwareBuffer *buffer = NULL;
         if (hw.allocate(&desc, &buffer)) { fprintf(stderr, "mgx11: no hardware buffer\n"); made = 0; break; }
         s->buffers[i] = buffer;
         hw.describe(buffer, &desc);
+        s->stride = desc.stride;
         const EGLint attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
         s->images[i] = hw.create_image(s->display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, hw.client_buffer(buffer),
                                        attributes);
@@ -433,7 +442,8 @@ static int make_buffers(struct window_surface *s)
     hw.bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
     s->waiting = -1;
     if (!made) release_buffers(s);
-    else fprintf(stderr, "mgx11: %dx%d through three hardware buffers over DRI3\n", s->width, s->height);
+    else fprintf(stderr, "mgx11: %dx%d through three hardware buffers over DRI3 (stride %u)\n", s->width, s->height,
+                 s->stride);
     return made;
 }
 
