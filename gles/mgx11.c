@@ -519,11 +519,11 @@ static int present_dri3(struct window_surface *s)
     hw.bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
 #define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
-    /* The GPU's frame is waited for and shown at once. MGX11_OVERLAP=1 shows each frame one later instead, so the
-     * CPU and GPU overlap: on the vivo, sprites from elsewhere in the atlases then flashed on the ground, which
-     * looks like vertex data rewritten while the GPU still read it (MobileGlues' buffer syncing). It was no
-     * smoother: 53 FPS on screen against 54. MGX11_VSYNC=1 lets the X server hold a frame for its next vblank,
-     * where a newer one replaces it: 30 FPS on screen of 60. */
+    /* The GPU's frame is waited for and shown at once. MGX11_OVERLAP=1 shows each frame one later instead, once the
+     * GPU has finished it, so the CPU works on the next frame while the GPU draws (patches/mobileglues-discard-new-
+     * storage.patch makes that safe). On the vivo, whose GPU is the limit, it showed fewer frames: 53 FPS on screen
+     * against 57. MGX11_VSYNC=1 lets the X server hold a frame for its next vblank, where a newer one replaces it:
+     * 30 FPS on screen of 60. */
     static int finish = -1, vsync = -1;
     if (finish < 0) finish = !(getenv("MGX11_OVERLAP") && !strcmp(getenv("MGX11_OVERLAP"), "1"));
     if (vsync < 0) vsync = getenv("MGX11_VSYNC") && !strcmp(getenv("MGX11_VSYNC"), "1");
