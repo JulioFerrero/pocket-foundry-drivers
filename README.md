@@ -20,7 +20,7 @@ The app also has the phone's own driver, which isn't here. Each driver's JSON in
 | PanVK 1.2.9 | Vulkan, through Zink | Mali-G76, built for the Huawei P40; other Bifrost Malis can try it | soulexit, MIT | Huawei P30, 60 FPS; Huawei P40; Galaxy S10, 17-37 FPS; Redmi Note 9 and Redmi 12 (G52) |
 | RADV for Xclipse 1.9.0 RC1 | Vulkan, through Zink | Samsung Xclipse 530 to 960 | JimVulkan, MIT | Galaxy S25 FE, 60 FPS; Galaxy A56, 54-59 FPS |
 | CPU | OpenGL on the processor (llvmpipe) | Any GPU, when no other driver starts | Mesa, MIT | |
-| MobileGlues 2.1.0, experimental | The phone's own OpenGL ES, through MobileGlues | Any GPU, chosen by hand | MobileGL-Dev, LGPL-2.1 | vivo X200 Ultra (Adreno 830), 59 FPS; Redmi 12 (Mali-G52), 45-60 FPS |
+| MobileGlues 2.2.0, experimental | The phone's own OpenGL ES, through MobileGlues | Any GPU, chosen by hand | MobileGL-Dev, LGPL-2.1 | vivo X200 Ultra (Adreno 830), 59 FPS; Redmi 12 (Mali-G52), 45-60 FPS; Galaxy XCover7 (Mali-G57), 55-60 FPS |
 
 A testing driver is listed in the app only after a long press on the driver screen's title.
 
@@ -53,9 +53,8 @@ A change to `tested`, `about` or the other shown fields only updates the catalog
 
 ## Fixes
 
-`fixes/` holds settings some drivers need on some phones, like the Adreno 740's on Android 16, or that make them
-faster there, like MobileGlues' on older Malis. The app applies them by itself: `drivers`, `gpus`, `android` and the
-`env` to set.
+`fixes/` holds settings some drivers need on some phones, like the Adreno 740's on Android 16. The app applies them
+by itself: `drivers`, `gpus`, `android` and the `env` to set.
 
 ## The catalog
 

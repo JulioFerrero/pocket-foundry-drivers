@@ -1,12 +1,20 @@
 {
   "name": "MobileGlues",
   "kind": "gles",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "about": "The phone's own OpenGL ES driver, without Zink or Vulkan: MobileGL-Dev's MobileGlues, made for Minecraft, turns the game's OpenGL into it, through libhybris. Experimental.",
   "madeBy": "MobileGL-Dev",
   "licence": "LGPL-2.1",
   "for": "Any GPU",
   "priority": 9,
+  "settings": [
+    {
+      "id": "wait",
+      "label": "Wait for each frame",
+      "about": "Off, the processor draws the next frame while the GPU finishes this one: up to twice as fast on older Malis. On, each frame shows as soon as it's drawn, which can be smoother on a phone already at 60 FPS.",
+      "env": {"MGX11_OVERLAP": "0"}
+    }
+  ],
   "source": {
     "git": "https://github.com/MobileGL-Dev/MobileGlues",
     "ref": "97558a69157b033b890958b1e49258c5b51a80c6"
@@ -64,6 +72,16 @@
       "version": "2.1.0",
       "result": "plays",
       "fps": "45-60",
+      "app": "0.8.18-beta.3",
+      "date": "2026-11-12"
+    },
+    {
+      "phone": "Galaxy XCover7",
+      "gpu": "Mali-G57 MC2",
+      "android": 15,
+      "version": "2.1.0",
+      "result": "plays",
+      "fps": "55-60",
       "app": "0.8.18-beta.3",
       "date": "2026-11-12"
     }
