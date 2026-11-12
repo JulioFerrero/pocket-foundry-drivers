@@ -1,0 +1,146 @@
+diff --git a/MobileGlues-cpp/gl/buffer.cpp b/MobileGlues-cpp/gl/buffer.cpp
+index d8fd66d..de1a7c9 100644
+--- a/MobileGlues-cpp/gl/buffer.cpp
++++ b/MobileGlues-cpp/gl/buffer.cpp
+@@ -42,6 +42,8 @@ struct buffer_group_state_t { // shared across a share group
+     std::vector<char> gen_buffer_exists;
+     std::vector<GLuint> free_buffer_ids;
+     std::vector<size_t> buffer_datasize;
++    // Given new storage by glBufferData(NULL) and not written since: see glMapBufferRange.
++    std::vector<char> buffer_orphaned;
+ };
+ 
+ struct buffer_ctx_state_t { // private to one context
+@@ -97,6 +99,7 @@ void mg_buffer_forget_context(unsigned long long ctx_id) {
+ #define g_gen_buffer_exists (g_bg->gen_buffer_exists)
+ #define g_free_buffer_ids (g_bg->free_buffer_ids)
+ #define g_buffer_datasize (g_bg->buffer_datasize)
++#define g_buffer_orphaned (g_bg->buffer_orphaned)
+ #define g_gen_arrays (g_bc->gen_arrays)
+ #define g_gen_array_exists (g_bc->gen_array_exists)
+ #define g_free_array_ids (g_bc->free_array_ids)
+@@ -126,6 +129,7 @@ static inline int ensure_buffer_capacity(GLuint id) {
+         g_gen_buffers.resize(id + 1, 0);
+         g_gen_buffer_exists.resize(id + 1, 0);
+         if (g_buffer_datasize.size() <= (size_t)id) g_buffer_datasize.resize(id + 1, 0);
++        if (g_buffer_orphaned.size() <= (size_t)id) g_buffer_orphaned.resize(id + 1, 0);
+     }
+     return 0;
+ }
+@@ -147,6 +151,7 @@ GLuint gen_buffer() {
+         g_gen_buffers[id] = 0;
+         g_gen_buffer_exists[id] = 1;
+         g_buffer_datasize[id] = 0;
++        g_buffer_orphaned[id] = 0;
+         if (id > (GLuint)maxBufferId) maxBufferId = id;
+         return id;
+     }
+@@ -155,6 +160,7 @@ GLuint gen_buffer() {
+     g_gen_buffers[maxBufferId] = 0;
+     g_gen_buffer_exists[maxBufferId] = 1;
+     g_buffer_datasize[maxBufferId] = 0;
++    g_buffer_orphaned[maxBufferId] = 0;
+     return (GLuint)maxBufferId;
+ }
+ 
+@@ -174,6 +180,7 @@ void remove_buffer(GLuint key) {
+         g_gen_buffer_exists[key] = 0;
+         g_gen_buffers[key] = 0;
+         if (key < g_buffer_datasize.size()) g_buffer_datasize[key] = 0;
++        if (key < g_buffer_orphaned.size()) g_buffer_orphaned[key] = 0;
+         g_free_buffer_ids.push_back(key);
+     }
+ }
+@@ -207,6 +214,18 @@ size_t get_buffer_data_size(GLuint buffer) {
+     return 0;
+ }
+ 
++static void set_buffer_orphaned(GLuint buffer, bool orphaned) {
++    ensure_buffer_capacity(buffer);
++    g_buffer_orphaned[buffer] = orphaned;
++}
++
++// Whether the buffer was orphaned and not written since; it no longer counts as orphaned after this.
++static bool take_buffer_orphaned(GLuint buffer) {
++    if (buffer >= g_buffer_orphaned.size() || !g_buffer_orphaned[buffer]) return false;
++    g_buffer_orphaned[buffer] = 0;
++    return true;
++}
++
+ static inline int binding_target_to_index(GLenum target) {
+     switch (target) {
+     case GL_ARRAY_BUFFER:
+@@ -1018,6 +1037,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
+     borrowed_target_t t(target);
+     GLES.glBufferData(t.target, size, data, usage);
+     set_buffer_data_size(find_bound_buffer_by_target(target), size);
++    set_buffer_orphaned(find_bound_buffer_by_target(target), !data);
+     CHECK_GL_ERROR
+ }
+ 
+@@ -1028,6 +1048,15 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
+     LOG_D("glBufferSubData, target = %s, offset = %p, size = %zi", glEnumToString(target), (void*)offset, size)
+     borrowed_target_t t(target);
+     GLES.glBufferSubData(t.target, offset, size, data);
++    set_buffer_orphaned(find_bound_buffer_by_target(target), false);
++    CHECK_GL_ERROR
++}
++
++void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset,
++                         GLsizeiptr size) {
++    LOG()
++    GLES.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
++    set_buffer_orphaned(find_bound_buffer_by_target(writeTarget), false);
+     CHECK_GL_ERROR
+ }
+ 
+@@ -1042,6 +1071,7 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
+ void* glMapBuffer(GLenum target, GLenum access) {
+     LOG()
+     LOG_D("glMapBuffer, target = %s, access = %s", glEnumToString(target), glEnumToString(access))
++    take_buffer_orphaned(find_bound_buffer_by_target(target));
+     if (g_gles_caps.GL_OES_mapbuffer) {
+         borrowed_target_t t(target);
+         return GLES.glMapBufferOES(t.target, access);
+@@ -1089,6 +1119,14 @@ extern "C"
+ 
+ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+     LOG()
++    // Factorio gives its vertex buffers new storage with glBufferData(NULL) at the start of each frame, then appends
++    // to them with maps that don't wait for the GPU. On an Adreno 830, with the GPU still drawing the frame before,
++    // those writes landed in the storage it was reading: sprites from elsewhere in the atlases and black squares on
++    // the ground. The first map after new storage discards the whole buffer instead, which the driver answers with
++    // fresh memory; nothing in the buffer was valid anyway.
++    if (take_buffer_orphaned(find_bound_buffer_by_target(target)) && (access & GL_MAP_UNSYNCHRONIZED_BIT) &&
++        !(access & GL_MAP_READ_BIT))
++        access = (access & ~GL_MAP_UNSYNCHRONIZED_BIT) | GL_MAP_INVALIDATE_BUFFER_BIT;
+     if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
+     //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
+     borrowed_target_t t(target);
+diff --git a/MobileGlues-cpp/gl/buffer.h b/MobileGlues-cpp/gl/buffer.h
+index dc7b4e2..56f487c 100644
+--- a/MobileGlues-cpp/gl/buffer.h
++++ b/MobileGlues-cpp/gl/buffer.h
+@@ -98,6 +98,9 @@ extern "C"
+ 
+     GLAPI GLAPIENTRY void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length);
+ 
++    GLAPI GLAPIENTRY void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset,
++                                              GLintptr writeOffset, GLsizeiptr size);
++
+     GLAPI GLAPIENTRY void glGenVertexArrays(GLsizei n, GLuint* arrays);
+ 
+     GLAPI GLAPIENTRY void glDeleteVertexArrays(GLsizei n, const GLuint* arrays);
+diff --git a/MobileGlues-cpp/gl/gl_native.cpp b/MobileGlues-cpp/gl/gl_native.cpp
+index 67eeea2..853ec77 100644
+--- a/MobileGlues-cpp/gl/gl_native.cpp
++++ b/MobileGlues-cpp/gl/gl_native.cpp
+@@ -215,7 +215,7 @@ NATIVE_FUNCTION_HEAD(void, glClearBufferiv, GLenum buffer, GLint drawbuffer, con
+ NATIVE_FUNCTION_HEAD(void, glClearBufferuiv, GLenum buffer, GLint drawbuffer, const GLuint *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferuiv, buffer,drawbuffer,value)
+ NATIVE_FUNCTION_HEAD(void, glClearBufferfv, GLenum buffer, GLint drawbuffer, const GLfloat *value) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfv, buffer,drawbuffer,value)
+ NATIVE_FUNCTION_HEAD(void, glClearBufferfi, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) NATIVE_FUNCTION_END_NO_RETURN(void, glClearBufferfi, buffer,drawbuffer,depth,stencil)
+-NATIVE_FUNCTION_HEAD(void, glCopyBufferSubData, GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) NATIVE_FUNCTION_END_NO_RETURN(void, glCopyBufferSubData, readTarget,writeTarget,readOffset,writeOffset,size)
++//NATIVE_FUNCTION_HEAD(void, glCopyBufferSubData, GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) NATIVE_FUNCTION_END_NO_RETURN(void, glCopyBufferSubData, readTarget,writeTarget,readOffset,writeOffset,size)
+ NATIVE_FUNCTION_HEAD(void, glGetUniformIndices, GLuint program, GLsizei uniformCount, const GLchar *const*uniformNames, GLuint *uniformIndices) NATIVE_FUNCTION_END_NO_RETURN(void, glGetUniformIndices, program,uniformCount,uniformNames,uniformIndices)
+ NATIVE_FUNCTION_HEAD(void, glGetActiveUniformsiv, GLuint program, GLsizei uniformCount, const GLuint *uniformIndices, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetActiveUniformsiv, program,uniformCount,uniformIndices,pname,params)
+ NATIVE_FUNCTION_HEAD(GLuint, glGetUniformBlockIndex, GLuint program, const GLchar *uniformBlockName) NATIVE_FUNCTION_END(GLuint, glGetUniformBlockIndex, program,uniformBlockName)
