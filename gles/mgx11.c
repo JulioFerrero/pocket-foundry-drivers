@@ -519,13 +519,13 @@ static int present_dri3(struct window_surface *s)
     hw.bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
 #define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001
-    /* The GPU's frame is waited for and shown at once. MGX11_OVERLAP=1 shows each frame one later instead, once the
-     * GPU has finished it, so the CPU works on the next frame while the GPU draws (patches/mobileglues-discard-new-
-     * storage.patch makes that safe). On the vivo, whose GPU is the limit, it showed fewer frames: 53 FPS on screen
-     * against 57. MGX11_VSYNC=1 lets the X server hold a frame for its next vblank, where a newer one replaces it:
-     * 30 FPS on screen of 60. */
+    /* Each frame is shown one later, once the GPU has finished it, so the CPU works on the next frame while the GPU
+     * draws (patches/mobileglues-discard-new-storage.patch makes that safe): on a Mali-G52, 45-60 FPS instead of
+     * 20-30. MGX11_OVERLAP=0 waits for the GPU and shows the frame at once, which showed more frames where the GPU is
+     * the limit: 57 FPS on screen against 53 on the vivo. MGX11_VSYNC=1 lets the X server hold a frame for its next
+     * vblank, where a newer one replaces it: 30 FPS on screen of 60. */
     static int finish = -1, vsync = -1;
-    if (finish < 0) finish = !(getenv("MGX11_OVERLAP") && !strcmp(getenv("MGX11_OVERLAP"), "1"));
+    if (finish < 0) finish = getenv("MGX11_OVERLAP") && !strcmp(getenv("MGX11_OVERLAP"), "0");
     if (vsync < 0) vsync = getenv("MGX11_VSYNC") && !strcmp(getenv("MGX11_VSYNC"), "1");
     const uint32_t options = vsync ? XCB_PRESENT_OPTION_NONE : XCB_PRESENT_OPTION_ASYNC;
     int shown;
