@@ -7,6 +7,23 @@ phone's GPU and downloads it, or the CPU driver when none works.
 Every driver here is built from source by this repository's CI, in the app's own build container, so it links
 against what the app ships. Nobody uploads a file.
 
+## The drivers
+
+The app also has the phone's own driver, which isn't here. Each driver's JSON in `drivers/` has the rest.
+
+| Driver | What it is | For | Made by | Tested on |
+|---|---|---|---|---|
+| Zink + Turnip | Vulkan, through Zink | Adreno 6xx and newer | Mesa, MIT | 15 phones, Adreno 618 to 840: 60 FPS on the vivo X200 Ultra, Galaxy S23 and S25 Ultra, AYN Thor, POCO F5 Pro |
+| Freedreno | OpenGL | Adreno 6xx and newer | Mesa, MIT | Nothing Phone (1), POCO X5 Pro 5G (Adreno 642L) |
+| PanVK-kbase 26.3.1 | Vulkan, through Zink | Mali-G615; other Bifrost and Valhall Malis can try it | zenithblue, MIT | realme 16 Pro, 60 FPS; Xiaomi 14T, 56-59 FPS |
+| PanVK-kbase 0.1.0 RC3 | Vulkan, through Zink | Mali-G77, G78; other Valhall Malis can try it | zenithblue, MIT | Xiaomi 11T, 60 FPS; Galaxy S20, 37-45 FPS; Pixel 6; Poco M6 Pro 4G (G57); Galaxy Tab S10 Ultra (G720) |
+| PanVK 1.2.9 | Vulkan, through Zink | Mali-G76, built for the Huawei P40; other Bifrost Malis can try it | soulexit, MIT | Huawei P30, 60 FPS; Huawei P40; Galaxy S10, 17-37 FPS; Redmi Note 9 and Redmi 12 (G52) |
+| RADV for Xclipse 1.9.0 RC1 | Vulkan, through Zink | Samsung Xclipse 530 to 960 | JimVulkan, MIT | Galaxy S25 FE, 60 FPS; Galaxy A56, 54-59 FPS |
+| CPU | OpenGL on the processor (llvmpipe) | Any GPU, when no other driver starts | Mesa, MIT | |
+| MobileGlues 2.0.0, testing | The phone's own OpenGL ES, through MobileGlues | Any GPU | MobileGL-Dev, LGPL-2.1 | vivo X200 Ultra, 59 FPS |
+
+A testing driver is listed in the app only after a long press on the driver screen's title.
+
 ## Adding a driver
 
 Open a pull request with one JSON in `drivers/`. CI builds it and checks that every library it links is in the
