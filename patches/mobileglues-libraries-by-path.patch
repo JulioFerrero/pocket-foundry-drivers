@@ -1,0 +1,18 @@
+MobileGlues reads its EGL and GLES from MG_EGL_LIBRARY and MG_GLES_LIBRARY: libhybris's, which have the same
+names as the Linux runtime's own (Mesa's glvnd), and aren't on the game's library path.
+
+diff --git a/MobileGlues-cpp/gles/loader.cpp b/MobileGlues-cpp/gles/loader.cpp
+index 726ff47..94593bd 100644
+--- a/MobileGlues-cpp/gles/loader.cpp
++++ b/MobileGlues-cpp/gles/loader.cpp
+@@ -138,7 +138,9 @@ void load_libs() {
+     // answer it either: a device whose system driver *is* ANGLE would say yes.
+     // Only the loader knows, so it reports.
+     g_angle_in_use = false;
+-    gles = open_lib(gles3_lib, gles_override, &g_angle_in_use);
++    // Pocket Foundry: libhybris's EGL and GLES, which have the same names as the Linux runtime's own, by path.
++    if (!want_angle) { gles_override = getenv("MG_GLES_LIBRARY"); egl_override = getenv("MG_EGL_LIBRARY"); }
++    gles = open_lib(gles3_lib, gles_override, want_angle ? &g_angle_in_use : nullptr);
+     egl = open_lib(egl_lib, egl_override, nullptr);
+     if (want_angle && !g_angle_in_use) {
+         LOG_E("ANGLE was requested but was not loaded; running on the system driver\n")

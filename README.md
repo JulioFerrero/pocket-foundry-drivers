@@ -15,7 +15,8 @@ app's runtime. Once merged, it's released and joins the catalog.
 | Field | |
 |---|---|
 | `name`, `about`, `madeBy`, `licence` | What the app shows |
-| `kind` | `vulkan`: a Vulkan driver the game reaches through Zink. `opengl`: a whole Mesa OpenGL driver. `cpu`: a whole Mesa that draws on the processor, for any GPU; app versions before 0.8.17-beta.10 skip it |
+| `kind` | `vulkan`: a Vulkan driver the game reaches through Zink. `opengl`: a whole Mesa OpenGL driver. `cpu`: a whole Mesa that draws on the processor, for any GPU; app versions before 0.8.17-beta.10 skip it. `gles`: MobileGlues, which turns the game's OpenGL into the phone's own OpenGL ES, for any GPU, built by `build/gles.sh` with the shim in `gles/`; app versions before 0.8.18-beta.2 skip it |
+| `testing` | `true`: not for players yet. The app lists it only after a long press on the driver screen's title, and never picks it by itself |
 | `version` | Shown instead of the Mesa version, for forks with their own |
 | `builtFor` | The phone it was made for, if it was made for one |
 | `for` | The GPUs it's for, as the app shows them: `Adreno 6xx and newer` |
@@ -28,7 +29,7 @@ app's runtime. Once merged, it's released and joins the catalog.
 | `compression` | `cpu` where the game's texture compressor fails on it |
 | `tested` | Phones it ran on: `phone`, `gpu`, `android`, the driver's `version`, `result`, `fps`, `app`, `date`, `link` |
 | `source` | `{"git", "ref"}`: a repository and a commit or tag |
-| `build` | `packages` to install, `prepare` steps the source needs, `mesa` (where Mesa's tree ends up), `patches` from `patches/`, Meson `options`, `licences` to ship |
+| `build` | `packages` to install, `prepare` steps the source needs, `mesa` (where Mesa's tree ends up), `patches` from `patches/`, Meson `options`, `licences` to ship. A `gles` driver has `cmake`, the folder of MobileGlues' CMake project, instead of `mesa` and `options` |
 
 A change to `tested`, `about` or the other shown fields only updates the catalog. A change to `kind`, `source`,
 `build` or the patches builds the driver again.

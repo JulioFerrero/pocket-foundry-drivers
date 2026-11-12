@@ -13,8 +13,8 @@ import urllib.request
 REPO = "JulioFerrero/pocket-foundry-drivers"
 DOWNLOADS = f"https://github.com/{REPO}/releases/download"
 # What the app shows and uses; the rest of a driver's JSON is for the build.
-SHOWN = ["name", "kind", "about", "madeBy", "licence", "builtFor", "priority", "for", "gpus", "family", "android",
-         "env", "settings", "compression", "tested"]
+SHOWN = ["name", "kind", "testing", "about", "madeBy", "licence", "builtFor", "priority", "for", "gpus", "family",
+         "android", "env", "settings", "compression", "tested"]
 
 
 def released(tag, out, id):
