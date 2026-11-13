@@ -16,7 +16,9 @@
   },
   "env": {
     "MESA_VK_WSI_DEBUG": "sw",
-    "DRIRC_CONFIGURATION": "pan_enable_vertex_pipeline_stores_atomics=false"
+    "DRIRC_CONFIGURATION": "pan_enable_vertex_pipeline_stores_atomics=false",
+    "PANVK_KBASE_TILER_IR": "0",
+    "PANVK_KBASE_HEAP_CHUNKS": "10,400"
   },
   "compression": "cpu",
   "tested": [
