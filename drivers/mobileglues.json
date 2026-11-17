@@ -2,7 +2,7 @@
   "name": "Phone's OpenGL ES",
   "kind": "gles",
   "version": "2.3.0",
-  "about": "The phone's own OpenGL ES driver, without Zink or Vulkan: MobileGL-Dev's MobileGlues, made for Minecraft, turns the game's OpenGL into it, through libhybris. Experimental.",
+  "about": "The phone's own OpenGL ES driver, without Zink or Vulkan: MobileGL-Dev's MobileGlues, made for Minecraft, turns the game's OpenGL into it, through libhybris.",
   "madeBy": "MobileGL-Dev",
   "licence": "LGPL-2.1",
   "for": "Any GPU",
