@@ -1,0 +1,347 @@
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 9791d29..7ef43ab 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -1073,6 +1073,10 @@ wsi_destroy_image(const struct wsi_swapchain *chain,
+    wsi->FreeMemory(chain->device, image->memory, &chain->alloc);
+    wsi->DestroyImage(chain->device, image->image, &chain->alloc);
+    wsi->DestroyImage(chain->device, image->blit.image, &chain->alloc);
++#if HAVE_LIBDRM
++   if (image->android_buffer)
++      wsi_release_android_buffer(image->android_buffer);
++#endif
+    wsi->FreeMemory(chain->device, image->blit.memory, &chain->alloc);
+    wsi->DestroyBuffer(chain->device, image->blit.buffer, &chain->alloc);
+ }
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index dbf65b2..ab39a1b 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -43,6 +43,9 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <xf86drm.h>
++#include <dlfcn.h>
++#include <sys/socket.h>
++#include "util/u_call_once.h"
+ 
+ static VkResult
+ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
+@@ -922,6 +925,221 @@ wsi_drm_image_needs_buffer_blit(const struct wsi_device *wsi,
+    return true;
+ }
+ 
++
++/* Pocket Foundry: swapchain images in Android hardware buffers.
++ *
++ * Termux:X11 maps a dma-buf it's given and uploads it into a texture with the CPU for every frame shown, since
++ * Android's EGL can't import dma-bufs: at 3168x1440 and 60 FPS, 40% of a core. An Android hardware buffer it can
++ * show as it is. So when POCKETFOUNDRY_HYBRIS names libhybris-common, which loads Android's own libraries into this
++ * glibc process, each image is a hardware buffer from Android's allocator: the GPU draws into it through its dma-buf,
++ * imported with the buffer's own row pitch, and the X server gets the buffer itself (DRI3 modifier 1255, as
++ * libhybris's swapchain sends its own). Anything that doesn't fit leaves the image to Mesa as before.
++ */
++struct android_buffer_desc {
++   uint32_t width, height, layers, format;
++   uint64_t usage;
++   uint32_t stride, rfu0;
++   uint64_t rfu1;
++};
++struct android_native_handle {
++   int version, num_fds, num_ints;
++   int data[];
++};
++#define ANDROID_FORMAT_R8G8B8A8_UNORM 1
++#define ANDROID_FORMAT_B8G8R8A8_UNORM 5
++#define ANDROID_USAGE_GPU_SAMPLED_IMAGE (1ull << 8)
++#define ANDROID_USAGE_GPU_FRAMEBUFFER (1ull << 9)
++
++static struct {
++   bool ready;
++   int (*allocate)(const struct android_buffer_desc *desc, void **buffer);
++   void (*release)(void *buffer);
++   void (*describe)(const void *buffer, struct android_buffer_desc *desc);
++   int (*send)(const void *buffer, int socket);
++   const struct android_native_handle *(*handle)(const void *buffer);
++} android;
++
++static void
++load_android(void)
++{
++   const char *path = getenv("POCKETFOUNDRY_HYBRIS");
++   if (!path || !*path)
++      return;
++   void *common = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
++   void *(*android_open)(const char *, int) = common ? dlsym(common, "android_dlopen") : NULL;
++   void *(*sym)(void *, const char *) = common ? dlsym(common, "android_dlsym") : NULL;
++   void *window = android_open && sym ? android_open("libnativewindow.so", RTLD_NOW) : NULL;
++   if (!window) {
++      fprintf(stderr, "wsi: Android hardware buffers: no libnativewindow through %s (%s)\n", path,
++              common ? "android_dlopen failed" : dlerror());
++      return;
++   }
++   *(void **)&android.allocate = sym(window, "AHardwareBuffer_allocate");
++   *(void **)&android.release = sym(window, "AHardwareBuffer_release");
++   *(void **)&android.describe = sym(window, "AHardwareBuffer_describe");
++   *(void **)&android.send = sym(window, "AHardwareBuffer_sendHandleToUnixSocket");
++   *(void **)&android.handle = sym(window, "AHardwareBuffer_getNativeHandle");
++   android.ready = android.allocate && android.release && android.describe && android.send && android.handle;
++   if (!android.ready)
++      fprintf(stderr, "wsi: Android hardware buffers: a function is missing from libnativewindow\n");
++}
++
++static bool
++android_buffers(void)
++{
++   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
++   util_call_once(&once, load_android);
++   return android.ready;
++}
++
++void
++wsi_release_android_buffer(void *buffer)
++{
++   android.release(buffer);
++}
++
++int
++wsi_send_android_buffer(void *buffer, int socket)
++{
++   return android.send(buffer, socket);
++}
++
++static VkResult
++wsi_create_android_image_mem(const struct wsi_swapchain *chain,
++                             const struct wsi_image_info *info,
++                             struct wsi_image *image)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   struct android_buffer_desc desc = {
++      .width = info->create.extent.width, .height = info->create.extent.height, .layers = 1,
++      .format = info->android_format, .usage = info->android_usage,
++   };
++   void *buffer = NULL;
++   if (android.allocate(&desc, &buffer) || !buffer)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   image->android_buffer = buffer;
++   android.describe(buffer, &desc);
++   const struct android_native_handle *handle = android.handle(buffer);
++   if (desc.stride * 4 != info->android_plane.rowPitch || !handle || handle->num_fds < 1) {
++      fprintf(stderr, "wsi: Android hardware buffers: a buffer unlike the first (stride %u)\n", desc.stride);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   VkMemoryRequirements reqs;
++   wsi->GetImageMemoryRequirements(chain->device, image->image, &reqs);
++   off_t size = lseek(handle->data[0], 0, SEEK_END);
++   if (size < 0 || (uint64_t)size < reqs.size) {
++      fprintf(stderr, "wsi: Android hardware buffers: %lld bytes for an image of %llu\n", (long long)size,
++              (unsigned long long)reqs.size);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   int fd = os_dupfd_cloexec(handle->data[0]);
++   if (fd < 0)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   const VkImportMemoryFdInfoKHR import_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++      .fd = fd,
++   };
++   const VkMemoryDedicatedAllocateInfo dedicated_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .pNext = &import_info,
++      .image = image->image,
++   };
++   const VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &dedicated_info,
++      .allocationSize = size,
++      .memoryTypeIndex = wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
++   };
++   VkResult result = wsi->AllocateMemory(chain->device, &memory_info, &chain->alloc, &image->memory);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      return result;
++   }
++
++   image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
++   image->drm_modifier = DRM_FORMAT_MOD_LINEAR;
++   image->num_planes = 1;
++   image->sizes[0] = size;
++   image->row_pitches[0] = info->android_plane.rowPitch;
++   image->offsets[0] = 0;
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_configure_android_image(const struct wsi_swapchain *chain,
++                            const VkSwapchainCreateInfoKHR *pCreateInfo,
++                            const struct wsi_drm_image_params *params,
++                            struct wsi_image_info *info)
++{
++   uint32_t format;
++   switch (pCreateInfo->imageFormat) {
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      format = ANDROID_FORMAT_B8G8R8A8_UNORM;
++      break;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      format = ANDROID_FORMAT_R8G8B8A8_UNORM;
++      break;
++   default:
++      return VK_ERROR_FORMAT_NOT_SUPPORTED;
++   }
++   if (params->explicit_sync || pCreateInfo->imageArrayLayers != 1 || !android_buffers())
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   /* Qualcomm's allocator compresses (UBWC) only when asked to, so this is linear, the layout the import describes.
++    * No CPU usage: the X server can still lock the buffer the rare times it copies a frame instead of flipping it,
++    * and on a vivo X200 Ultra a CPU-readable one cost the game 170 MB more heap. */
++   uint64_t usage = ANDROID_USAGE_GPU_SAMPLED_IMAGE | ANDROID_USAGE_GPU_FRAMEBUFFER;
++   const char *extra = getenv("POCKETFOUNDRY_HYBRIS_USAGE");
++   if (extra)
++      usage = strtoull(extra, NULL, 0);
++   /* The allocator gives every buffer of a size the same row pitch: the images are made with the first's. */
++   struct android_buffer_desc desc = {
++      .width = pCreateInfo->imageExtent.width, .height = pCreateInfo->imageExtent.height, .layers = 1,
++      .format = format, .usage = usage,
++   };
++   void *probe = NULL;
++   if (android.allocate(&desc, &probe) || !probe) {
++      fprintf(stderr, "wsi: Android hardware buffers: none of %ux%u (usage 0x%llx)\n", desc.width, desc.height,
++              (unsigned long long)usage);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++   android.describe(probe, &desc);
++   android.release(probe);
++
++   VkResult result = wsi_configure_image(chain, pCreateInfo, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, info);
++   if (result != VK_SUCCESS)
++      return result;
++   info->android_format = format;
++   info->android_usage = usage;
++   info->android_plane = (VkSubresourceLayout) { .offset = 0, .rowPitch = desc.stride * 4 };
++   info->android_layout = (VkImageDrmFormatModifierExplicitCreateInfoEXT) {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++      .drmFormatModifierPlaneCount = 1,
++      .pPlaneLayouts = &info->android_plane,
++   };
++   info->create.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++   __vk_append_struct(&info->create, &info->android_layout);
++   info->create_mem = wsi_create_android_image_mem;
++
++   /* Turnip refuses a pitch it can't draw with: try one image before committing the swapchain to them. */
++   VkImage image;
++   result = chain->wsi->CreateImage(chain->device, &info->create, &chain->alloc, &image);
++   if (result != VK_SUCCESS) {
++      fprintf(stderr, "wsi: Android hardware buffers: the GPU can't use a row pitch of %u pixels\n", desc.stride);
++      wsi_destroy_image_info(chain, info);
++      return result;
++   }
++   chain->wsi->DestroyImage(chain->device, image, &chain->alloc);
++   fprintf(stderr, "wsi: Android hardware buffers of %ux%u, stride %u, usage 0x%llx\n", desc.width, desc.height,
++           desc.stride, (unsigned long long)usage);
++   return VK_SUCCESS;
++}
++
+ VkResult
+ wsi_drm_configure_image(const struct wsi_swapchain *chain,
+                         const VkSwapchainCreateInfoKHR *pCreateInfo,
+@@ -935,6 +1153,8 @@ wsi_drm_configure_image(const struct wsi_swapchain *chain,
+                                        params,
+                                        info);
+    } else {
++      if (wsi_configure_android_image(chain, pCreateInfo, params, info) == VK_SUCCESS)
++         return VK_SUCCESS;
+       return wsi_configure_native_image(chain, pCreateInfo,
+                                         params,
+                                         info);
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 58b592a..30c37b4 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -133,6 +133,12 @@ struct wsi_image_info {
+    VkResult (*finish_create)(const struct wsi_swapchain *chain,
+                              const struct wsi_image_info *info,
+                              struct wsi_image *image);
++
++   /* Pocket Foundry: images in Android hardware buffers (wsi_common_drm.c). */
++   VkImageDrmFormatModifierExplicitCreateInfoEXT android_layout;
++   VkSubresourceLayout android_plane;
++   uint32_t android_format;
++   uint64_t android_usage;
+ };
+ 
+ enum wsi_explicit_sync_timelines
+@@ -191,6 +197,8 @@ struct wsi_image {
+    int dma_buf_fd;
+ #endif
+    void *cpu_map;
++   /* Pocket Foundry: the Android hardware buffer that holds the image, if any. */
++   void *android_buffer;
+ 
+    VkQueryPool query_pool;
+    VkCommandBuffer *timestamp_cmd_buffers;
+@@ -458,6 +466,12 @@ void
+ wsi_destroy_image(const struct wsi_swapchain *chain,
+                   struct wsi_image *image);
+ 
++/* Pocket Foundry: an image's Android hardware buffer, through libhybris (wsi_common_drm.c). */
++void
++wsi_release_android_buffer(void *buffer);
++int
++wsi_send_android_buffer(void *buffer, int socket);
++
+ VkResult
+ wsi_swapchain_wait_for_present_semaphore(const struct wsi_swapchain *chain,
+                                          uint64_t present_id, uint64_t timeout);
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index fd4d5fd..e29ed21 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -52,6 +52,7 @@
+ #include "util/hash_table.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_file.h"
++#include <sys/socket.h>
+ #include "util/os_time.h"
+ #include "util/u_debug.h"
+ #include "util/u_thread.h"
+@@ -2736,7 +2737,34 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+    }
+    image->pixmap = xcb_generate_id(chain->conn);
+ 
+-   if (image->base.drm_modifier != DRM_FORMAT_MOD_INVALID) {
++   if (image->base.android_buffer) {
++      /* Pocket Foundry: the buffer itself (wsi_common_drm.c). The server reads it from the socket while it handles
++       * the request: our end stays open until then. libxcb owns the other end once sent. */
++      int pair[2];
++      if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) {
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail_image;
++      }
++      if (wsi_send_android_buffer(image->base.android_buffer, pair[0])) {
++         close(pair[0]);
++         close(pair[1]);
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail_image;
++      }
++      cookie =
++         xcb_dri3_pixmap_from_buffers_checked(chain->conn, image->pixmap, chain->window, 1,
++                                              pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
++                                              image->base.row_pitches[0], 0, 0, 0, 0, 0, 0, 0,
++                                              chain->depth, bpp, 1255 /* AHARDWAREBUFFER_SOCKET_FD */, &pair[1]);
++      error = xcb_request_check(chain->conn, cookie);
++      close(pair[0]);
++      if (error != NULL) {
++         fprintf(stderr, "wsi: the X server refused an Android hardware buffer (error %d)\n", error->error_code);
++         free(error);
++         goto fail_image;
++      }
++      goto out_fence;
++   } else if (image->base.drm_modifier != DRM_FORMAT_MOD_INVALID) {
+       /* If the image has a modifier, we must have DRI3 v1.2. */
+       assert(chain->has_dri3_modifiers);
+ 

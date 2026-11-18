@@ -40,7 +40,8 @@
   },
   "build": {
     "patches": ["patches/mesa-x11-wait-for-the-frame-before-presenting.patch",
-                "patches/mesa-tu-kgsl-force-8-channel-macrotile-on-a635.patch"],
+                "patches/mesa-tu-kgsl-force-8-channel-macrotile-on-a635.patch",
+                "patches/mesa-x11-android-hardware-buffers.patch"],
     "options": [
       "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=freedreno", "-Dfreedreno-kmds=kgsl,msm",
       "-Dopengl=false", "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled",
