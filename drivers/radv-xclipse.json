@@ -1,7 +1,7 @@
 {
   "name": "RADV for Xclipse",
   "kind": "vulkan",
-  "version": "1.9.0 RC1",
+  "version": "1.9.0",
   "about": "Mesa's RADV, ported by JimVulkan to Samsung's Xclipse GPUs and their kernel driver.",
   "madeBy": "JimVulkan",
   "licence": "MIT",
@@ -20,7 +20,7 @@
   ],
   "source": {
     "git": "https://github.com/JimVulkan/radv-xclipse",
-    "ref": "v1.9.0-RC1"
+    "ref": "v1.9.0"
   },
   "build": {
     "prepare": [
