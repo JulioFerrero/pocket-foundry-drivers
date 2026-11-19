@@ -1,7 +1,7 @@
 {
   "name": "PanVK",
   "kind": "vulkan",
-  "version": "1.2.9",
+  "version": "1.3.0",
   "about": "Mesa's open Vulkan driver for Mali, with soulexit's patches for the Kirin 990's kernel driver.",
   "madeBy": "soulexit",
   "licence": "MIT",
@@ -32,7 +32,7 @@
   ],
   "source": {
     "git": "https://github.com/soulexit/panvk-kirin990",
-    "ref": "v1.2.9"
+    "ref": "v1.3.0"
   },
   "build": {
     "packages": ["llvm-19-dev", "libclang-19-dev", "libclang-cpp19-dev", "clang-19", "libclc-19-dev",
@@ -43,11 +43,11 @@
       "sh scripts/prepare-tree.sh \"$PWD/tree\""
     ],
     "mesa": "tree/mesa",
-    "patches": ["patches/panvk-kbase-ion-only-when-it-allocates.patch"],
+    "patches": ["patches/panvk-kirin990-1.3-ion-only-when-it-allocates.patch"],
     "licences": ["LICENSE", "NOTICE.md"],
     "options": [
       "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=panfrost", "-Dpanfrost-kmds=kbase",
-      "-Dmesa-clc=enabled", "-Dprecomp-compiler=enabled", "-Dllvm=enabled", "-Dshared-llvm=enabled",
+      "-Dmesa-clc=enabled", "-Dprecomp-compiler=enabled", "-Dpanfrost-rust=false", "-Dllvm=enabled", "-Dshared-llvm=enabled",
       "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Dgles1=disabled", "-Dgles2=disabled",
       "-Dopengl=false", "-Dvulkan-layers=[]", "-Dtools=[]", "-Dbuild-tests=false", "-Dhtml-docs=disabled",
       "-Dvalgrind=disabled", "-Dlibunwind=disabled", "-Dlmsensors=disabled", "-Dxlib-lease=disabled",

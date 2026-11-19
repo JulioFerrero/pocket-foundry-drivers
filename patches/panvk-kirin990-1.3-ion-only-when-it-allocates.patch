@@ -1,0 +1,38 @@
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 2eb791e..f31f7fb 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2149,6 +2149,33 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+                   break;
+                }
+             }
++            /* Some vendor kernels (MediaTek's on Android 13 and 14) answer the
++             * heap query but refuse this ABI's allocation with ENOTTY, and
++             * every BO that needs a dma-buf then fails. Allocate once to know;
++             * refused, try the legacy ABI, as a kernel without the query. */
++            if (kbase_dev->ion_heap_mask) {
++               struct kbase_ion_alloc probe = {
++                  .len = 4096,
++                  .heap_id_mask = kbase_dev->ion_heap_mask,
++               };
++               if (ioctl(ion, KBASE_ION_IOC_ALLOC, &probe)) {
++                  query_errno = errno;
++                  mesa_logi("kbase: ION system heap doesn't allocate (%s)",
++                            strerror(errno));
++                  kbase_dev->ion_heap_mask = 0;
++                  int fd = kbase_ion_legacy_alloc(
++                     ion, 4096, KBASE_ION_LEGACY_SYSTEM_HEAP_MASK, 0);
++                  legacy_errno = fd < 0 ? errno : 0;
++                  if (fd >= 0) {
++                     close(fd);
++                     kbase_dev->ion_heap_mask =
++                        KBASE_ION_LEGACY_SYSTEM_HEAP_MASK;
++                     kbase_dev->ion_legacy = true;
++                  }
++               } else {
++                  close(probe.fd);
++               }
++            }
+          } else {
+             query_errno = errno;
+             /* No HEAP_QUERY: try the legacy ABI with the system heap. */
