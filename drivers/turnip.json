@@ -36,11 +36,10 @@
   ],
   "source": {
     "git": "https://github.com/lfdevs/mesa-for-android-container",
-    "ref": "eb3e7fd4f009cab04b1482aad4843c0bde28a786"
+    "ref": "1e6ee4d1ee635804c4f2bef41556db34405ea06b"
   },
   "build": {
-    "patches": ["patches/mesa-x11-wait-for-the-frame-before-presenting.patch",
-                "patches/mesa-tu-kgsl-force-8-channel-macrotile-on-a635.patch",
+    "patches": ["patches/mesa-tu-kgsl-force-8-channel-macrotile-on-a635.patch",
                 "patches/mesa-x11-android-hardware-buffers.patch"],
     "options": [
       "-Dplatforms=x11", "-Dgallium-drivers=", "-Dvulkan-drivers=freedreno", "-Dfreedreno-kmds=kgsl,msm",
