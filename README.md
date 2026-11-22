@@ -20,7 +20,7 @@ The app also has the phone's own driver, which isn't here. Each driver's JSON in
 | PanVK 1.2.9 | Vulkan, through Zink | Mali-G76, built for the Huawei P40; other Bifrost Malis can try it | soulexit, MIT | Huawei P30, 60 FPS; Huawei P40; Galaxy S10, 17-37 FPS; Redmi Note 9 and Redmi 12 (G52) |
 | RADV for Xclipse 1.9.0 RC1 | Vulkan, through Zink | Samsung Xclipse 530 to 960 | JimVulkan, MIT | Galaxy S25 FE, 60 FPS; Galaxy A56, 54-59 FPS |
 | CPU | OpenGL on the processor (llvmpipe) | Any GPU, when no other driver starts | Mesa, MIT | |
-| Phone's OpenGL ES (MobileGlues 2.3.0) | The phone's own OpenGL ES, through MobileGlues | Any GPU: first on those without Vulkan 1.1, and the one every phone falls back on before the CPU | MobileGL-Dev, LGPL-2.1 | vivo X200 Ultra (Adreno 830), 59 FPS; OnePlus Nord 3 5G (Mali-G710), 60 FPS; Tecno Camon 50 Ultra and Pova 7 Ultra 5G (Mali-G615), 60 FPS; Galaxy A34 5G (Mali-G68), 22-60 FPS; Galaxy XCover7 (Mali-G57), 55-60 FPS; Redmi 12C and Redmi 12 (Mali-G52), 45-60 FPS |
+| Phone's OpenGL ES (MobileGlues 2.3.0) | The phone's own OpenGL ES, through MobileGlues | Any GPU: first on the Mali-G52, G57, G610 and G710 and on GPUs without Vulkan 1.1, and the one every phone falls back on before the CPU | MobileGL-Dev, LGPL-2.1 | vivo X200 Ultra (Adreno 830), 59 FPS; OnePlus Nord 3 5G (Mali-G710), 60 FPS; Tecno Camon 50 Ultra and Pova 7 Ultra 5G (Mali-G615), 60 FPS; Galaxy A34 5G (Mali-G68), 22-60 FPS; Galaxy XCover7 (Mali-G57), 55-60 FPS; Redmi 12C and Redmi 12 (Mali-G52), 45-60 FPS |
 
 A testing driver is listed in the app only after a long press on the driver screen's title.
 
@@ -37,7 +37,7 @@ app's runtime. Once merged, it's released and joins the catalog.
 | `version` | Shown instead of the Mesa version, for forks with their own |
 | `builtFor` | The phone it was made for, if it was made for one |
 | `for` | The GPUs it's for, as the app shows them: `Adreno 6xx and newer` |
-| `gpus` | The same GPUs as Android names them, to match the phone's: `*Adreno (TM) 7*`, `*Mali-G76*`. Start and end with `*`: on some phones Android wraps the name, as in `ANGLE ((Samsung Xclipse 540) on Vulkan 1.3.279)` |
+| `gpus` | The same GPUs as Android names them, to match the phone's: `*Adreno (TM) 7*`, `*Mali-G76*`. Start and end with `*`: on some phones Android wraps the name, as in `ANGLE ((Samsung Xclipse 540) on Vulkan 1.3.279)`. A driver for any GPU lists the ones it comes first on, ahead of Phone's Vulkan: MobileGlues where it played better (Mali-G52, G57, G610, G710) |
 | `family` | GPUs it might work on: they see it under To try |
 | `android` | `{"min": 12}`: the oldest Android it runs on |
 | `priority` | Lower comes first when several fit a GPU |
