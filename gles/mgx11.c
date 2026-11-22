@@ -2,13 +2,15 @@
  * The EGL library SDL loads (SDL_EGL_LIBRARY) for a game MobileGlues draws on Android's own OpenGL ES driver
  * through libhybris. libhybris has no X11 window surfaces, so a window surface here is a pbuffer of the window's
  * size. At every eglSwapBuffers the GPU copies it into one of three Android hardware buffers, which the X server
- * (Termux:X11) took once over DRI3, as libhybris's Vulkan swapchain does in the app (runtime/hybris/patches/0001);
- * without them, the CPU copies it with XPutImage. Everything else goes to MobileGlues' EGL (MG_LIBRARY). */
+ * (Termux:X11) took once over DRI3, as libhybris's Vulkan swapchain does in the app (runtime/hybris/patches/0001),
+ * and shows as they are (flips them in); without them, the CPU copies it with XPutImage. Everything else goes to
+ * MobileGlues' EGL (MG_LIBRARY). */
 #define _GNU_SOURCE
 #include <EGL/egl.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <dlfcn.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <xcb/dri3.h>
@@ -76,12 +78,24 @@ struct window_surface {
     void *buffers[3], *images[3];
     unsigned textures[3], framebuffers[3];
     uint32_t pixmaps[3];
-    unsigned next_buffer;
     unsigned stride;
     /* A frame goes to the X server once the GPU has drawn it, a frame later, so the CPU and GPU overlap. */
     void *fences[3];
     int waiting;   /* the buffer drawn last frame, -1 if none */
     uint32_t serial;
+    /* The X server's word on our buffers (Present's events): each buffer's last present while the X server has it, 0
+     * once it gives the buffer back (IdleNotify); when each came back, to draw into the one free longest. */
+    xcb_special_event_t *events;
+    uint32_t event_id;
+    uint32_t presented[3];
+    unsigned given_back[3], given_back_count;
+    unsigned outstanding;   /* presents not completed yet */
+    int async;              /* presents the X server copies (see present_dri3) */
+    int drain;              /* the last ones weren't: let them finish first */
+    int copies_in_row;
+    int stalled;            /* no buffer came back in time: the screen stopped drawing */
+    unsigned flipped, copied, skipped;
+    double wait_ms;
     double blit_ms, present_ms;
     double second_start;
     unsigned second_frames, fps;
@@ -372,6 +386,13 @@ static int load_hw(void)
 
 static void release_buffers(struct window_surface *s)
 {
+    if (s->events) {
+        xcb_present_select_input(hw.xcb, s->event_id, s->window, 0);
+        xcb_unregister_for_special_event(hw.xcb, s->events);
+        s->events = NULL;
+    }
+    memset(s->presented, 0, sizeof s->presented);
+    s->outstanding = 0;
     for (int i = 0; i < 3; i++) {
         if (s->pixmaps[i]) xcb_free_pixmap(hw.xcb, s->pixmaps[i]);
         if (s->framebuffers[i]) hw.delete_framebuffers(1, &s->framebuffers[i]);
@@ -441,10 +462,94 @@ static int make_buffers(struct window_surface *s)
     hw.bind_texture(GL_TEXTURE_2D, texture);
     hw.bind_framebuffer(GL_DRAW_FRAMEBUFFER, draw);
     s->waiting = -1;
+    if (made) {
+        s->event_id = xcb_generate_id(hw.xcb);
+        xcb_present_select_input(hw.xcb, s->event_id, s->window,
+                                 XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+        s->events = xcb_register_for_special_xge(hw.xcb, &xcb_present_id, s->event_id, NULL);
+        const char *async = getenv("MGX11_ASYNC");
+        s->async = async && !strcmp(async, "1");
+        s->drain = s->copies_in_row = s->stalled = 0;
+    }
     if (!made) release_buffers(s);
-    else fprintf(stderr, "mgx11: %dx%d through three hardware buffers over DRI3 (stride %u)\n", s->width, s->height,
-                 s->stride);
+    else fprintf(stderr, "mgx11: %dx%d through three hardware buffers over DRI3 (stride %u)%s\n", s->width, s->height,
+                 s->stride, s->async ? ", presents copied" : "");
     return made;
+}
+
+/* The X server's events since the last look. */
+static void read_events(struct window_surface *s)
+{
+    xcb_generic_event_t *event;
+    while ((event = xcb_poll_for_special_event(hw.xcb, s->events))) {
+        s->stalled = 0;
+        xcb_present_generic_event_t *present = (xcb_present_generic_event_t *)event;
+        if (present->evtype == XCB_PRESENT_EVENT_IDLE_NOTIFY) {
+            xcb_present_idle_notify_event_t *idle = (xcb_present_idle_notify_event_t *)event;
+            /* A buffer presented again since is still the X server's. */
+            for (int i = 0; i < 3; i++)
+                if (s->pixmaps[i] == idle->pixmap && s->presented[i] == idle->serial) {
+                    s->presented[i] = 0;
+                    s->given_back[i] = ++s->given_back_count;
+                }
+        } else if (present->evtype == XCB_PRESENT_EVENT_COMPLETE_NOTIFY) {
+            xcb_present_complete_notify_event_t *complete = (xcb_present_complete_notify_event_t *)event;
+            if (complete->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
+                if (s->outstanding) s->outstanding--;
+                if (complete->mode == XCB_PRESENT_COMPLETE_MODE_FLIP) {
+                    s->flipped++;
+                    s->copies_in_row = 0;
+                } else if (complete->mode == XCB_PRESENT_COMPLETE_MODE_SKIP) {
+                    s->skipped++;
+                } else {
+                    s->copied++;
+                    /* The X server can't flip them (the window isn't the screen's size): a copy waiting for the
+                     * screen's next frame would only show fewer frames. */
+                    if (!s->async && ++s->copies_in_row == 3) {
+                        s->async = s->drain = 1;
+                        fprintf(stderr, "mgx11: the X server copies the frames, so it gets them at once\n");
+                    }
+                }
+            }
+        }
+        free(event);
+    }
+    /* Errors of the requests not checked: nothing to do about them. */
+    while ((event = xcb_poll_for_event(hw.xcb))) free(event);
+}
+
+/* Waits for the X server's next events, until [deadline]: 0 once it has passed. */
+static int wait_events(double deadline)
+{
+    int left = (int)(deadline - now_ms() + 0.999);
+    if (left <= 0) return 0;
+    struct pollfd fd = {xcb_get_file_descriptor(hw.xcb), POLLIN, 0};
+    poll(&fd, 1, left);
+    return 1;
+}
+
+/* A buffer the X server gave back, the one free longest: the screen's renderer may still be drawing the last one it
+ * had. When none comes back in 100 ms, the screen has stopped drawing (it's off) and holds the last frame presented
+ * in its queue, which the next present replaces anyway: that one, without waiting again until the X server speaks. */
+static int free_buffer(struct window_surface *s)
+{
+    double start = now_ms(), deadline = start + (s->stalled ? 0 : 100);
+    int found = -1;
+    do {
+        read_events(s);
+        for (int i = 0; i < 3; i++)
+            if (!s->presented[i] && i != s->waiting && (found < 0 || s->given_back[i] < s->given_back[found]))
+                found = i;
+    } while (found < 0 && wait_events(deadline));
+    if (found < 0) {
+        if (!s->stalled) fprintf(stderr, "mgx11: no buffer given back in 100 ms: the screen isn't drawing\n");
+        s->stalled = 1;
+        for (int i = 0; i < 3; i++)
+            if (i != s->waiting && (found < 0 || s->presented[i] > s->presented[found])) found = i;
+        s->presented[found] = 0;
+    }
+    s->wait_ms += now_ms() - start;
+    return found;
 }
 
 
@@ -496,8 +601,8 @@ static int present_dri3(struct window_surface *s)
 {
     if (!s->dri3) s->dri3 = load_hw() && make_buffers(s) ? 1 : -1;
     if (s->dri3 < 0) return 0;
+    int i = free_buffer(s);
     double start = now_ms();
-    int i = s->next_buffer++ % 3;
     int read = 0, draw = 0;
     hw.get_integer(GL_READ_FRAMEBUFFER_BINDING, &read);
     hw.get_integer(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
@@ -522,12 +627,9 @@ static int present_dri3(struct window_surface *s)
     /* Each frame is shown one later, once the GPU has finished it, so the CPU works on the next frame while the GPU
      * draws (patches/mobileglues-discard-new-storage.patch makes that safe): on a Mali-G52, 45-60 FPS instead of
      * 20-30. MGX11_OVERLAP=0 waits for the GPU and shows the frame at once, which showed more frames where the GPU is
-     * the limit: 57 FPS on screen against 53 on the vivo. MGX11_VSYNC=1 lets the X server hold a frame for its next
-     * vblank, where a newer one replaces it: 30 FPS on screen of 60. */
-    static int finish = -1, vsync = -1;
+     * the limit: 57 FPS on screen against 53 on the vivo. */
+    static int finish = -1;
     if (finish < 0) finish = getenv("MGX11_OVERLAP") && !strcmp(getenv("MGX11_OVERLAP"), "0");
-    if (vsync < 0) vsync = getenv("MGX11_VSYNC") && !strcmp(getenv("MGX11_VSYNC"), "1");
-    const uint32_t options = vsync ? XCB_PRESENT_OPTION_NONE : XCB_PRESENT_OPTION_ASYNC;
     int shown;
     if (finish) {
         hw.finish();
@@ -544,16 +646,30 @@ static int present_dri3(struct window_surface *s)
     }
     double blitted = now_ms();
     if (shown >= 0) {
-        xcb_present_pixmap(hw.xcb, s->window, s->pixmaps[shown], ++s->serial, 0, 0, 0, 0, 0, 0, 0, options,
-                           0, 0, 0, 0, NULL);
+        /* A present for the screen's next frame, which Termux:X11 flips in: the renderer draws our buffer as it is,
+         * without the CPU copy an ASYNC one gets (it flips those only with PresentCapabilityAsync, which it doesn't
+         * advertise). On a Xiaomi 12T (Mali-G610) at 60 FPS, the X server's CPU went from 20-26% of a core to 6-7% at
+         * 1608x726 and from 35-45% to 5-7% at 2712x1220. The X server gives a buffer back once a newer one is shown
+         * (free_buffer). MGX11_ASYNC=1 copies, as before. */
+        if (s->drain) {
+            double deadline = now_ms() + 100;
+            do read_events(s); while (s->outstanding && wait_events(deadline));
+            s->drain = 0;
+        }
+        s->presented[shown] = ++s->serial;
+        s->outstanding++;
+        xcb_present_pixmap(hw.xcb, s->window, s->pixmaps[shown], s->serial, 0, 0, 0, 0, 0, 0, 0,
+                           s->async ? XCB_PRESENT_OPTION_ASYNC : XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
         xcb_flush(hw.xcb);
     }
     s->blit_ms += blitted - start;
     s->present_ms += now_ms() - blitted;
     if (++s->frames % 300 == 0) {
-        fprintf(stderr, "mgx11: %dx%d, last 300 frames: GPU copy %.1f ms, wait and present %.2f ms a frame\n",
-                s->width, s->height, s->blit_ms / 300, s->present_ms / 300);
-        s->blit_ms = s->present_ms = 0;
+        fprintf(stderr, "mgx11: %dx%d, last 300 frames: wait for a buffer %.2f ms, GPU copy %.1f ms, wait and present "
+                "%.2f ms a frame; %u flipped, %u copied, %u skipped\n", s->width, s->height, s->wait_ms / 300,
+                s->blit_ms / 300, s->present_ms / 300, s->flipped, s->copied, s->skipped);
+        s->wait_ms = s->blit_ms = s->present_ms = 0;
+        s->flipped = s->copied = s->skipped = 0;
     }
     return 1;
 }
