@@ -1,0 +1,17 @@
+MobileGlues offers OpenGL 4.1 instead of 4.0, still with 4.0's features. Factorio's demo (2.1.23) asks for a 4.1 context
+and stops when it can't have one ("4.1 was requested but customGLVersion is 4.0"); the full game asks for less and plays
+the same either way (Xiaomi 12T, Mali-G610: demo main menu at 60 FPS, a full 2.1.24 save at 57-60 FPS).
+
+diff --git a/MobileGlues-cpp/config/settings.h b/MobileGlues-cpp/config/settings.h
+index ac0a00a..d4286b7 100644
+--- a/MobileGlues-cpp/config/settings.h
++++ b/MobileGlues-cpp/config/settings.h
+@@ -20,7 +20,7 @@
+ typedef unsigned long size_t;
+ #endif
+ 
+-#define DEFAULT_GL_VERSION 40
++#define DEFAULT_GL_VERSION 41
+ 
+ // The distinct multi-draw *implementations*. Which of them are actually distinct
+ // differs per entry point; md_entry_desc_t::allowed encodes that.

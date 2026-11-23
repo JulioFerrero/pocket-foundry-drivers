@@ -36,7 +36,8 @@
       "patches/mobileglues-libraries-by-path.patch",
       "patches/mobileglues-bc-read-back.patch",
       "patches/mobileglues-discard-new-storage.patch",
-      "patches/mobileglues-bc-as-astc.patch"
+      "patches/mobileglues-bc-as-astc.patch",
+      "patches/mobileglues-gl-4.1.patch"
     ],
     "licences": [
       "LICENSE",
