@@ -1,0 +1,11 @@
+{
+  "name": "PanVK-kbase keeps the GPU while sprites load",
+  "about": "PanVK-kbase renews its tiler heap only every 65536 units of drawing work, and Factorio draws its sprites with far more in between: the heap filled up to its 400 MB and the GPU was lost (\"CSF group 0 tiler heap OOM\"). Renewing it every 4096 keeps it in bounds. On the Xiaomi 12T, 16384 still loaded and 32768 lost the GPU; 4096 leaves room for Space Age, mods and High sprites.",
+  "drivers": ["panvk-kbase-26"],
+  "gpus": ["*Mali*"],
+  "env": {"PANVK_KBASE_HEAP_RENEW_WORK": "4096"},
+  "tested": [
+    {"phone": "Xiaomi 12T", "gpu": "Mali-G610 MC6", "android": 15, "result": "plays",
+     "fps": "59 (a new map), 17-19 (Klonan's megabase, CPU-bound)", "app": "0.9.4-beta.2", "date": "2026-11-24"}
+  ]
+}
