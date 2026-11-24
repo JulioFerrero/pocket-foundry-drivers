@@ -14,7 +14,7 @@ index 9791d29..7ef43ab 100644
     wsi->DestroyBuffer(chain->device, image->blit.buffer, &chain->alloc);
  }
 diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
-index dbf65b2..ab39a1b 100644
+index dbf65b2..a1b9018 100644
 --- a/src/vulkan/wsi/wsi_common_drm.c
 +++ b/src/vulkan/wsi/wsi_common_drm.c
 @@ -43,6 +43,9 @@
@@ -27,7 +27,7 @@ index dbf65b2..ab39a1b 100644
  
  static VkResult
  wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
-@@ -922,6 +925,221 @@ wsi_drm_image_needs_buffer_blit(const struct wsi_device *wsi,
+@@ -922,6 +925,234 @@ wsi_drm_image_needs_buffer_blit(const struct wsi_device *wsi,
     return true;
  }
  
@@ -214,6 +214,8 @@ index dbf65b2..ab39a1b 100644
 +      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 +   }
 +   android.describe(probe, &desc);
++   const struct android_native_handle *probe_handle = android.handle(probe);
++   off_t probe_size = probe_handle && probe_handle->num_fds > 0 ? lseek(probe_handle->data[0], 0, SEEK_END) : -1;
 +   android.release(probe);
 +
 +   VkResult result = wsi_configure_image(chain, pCreateInfo, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, info);
@@ -240,7 +242,18 @@ index dbf65b2..ab39a1b 100644
 +      wsi_destroy_image_info(chain, info);
 +      return result;
 +   }
++   VkMemoryRequirements reqs;
++   chain->wsi->GetImageMemoryRequirements(chain->device, image, &reqs);
 +   chain->wsi->DestroyImage(chain->device, image, &chain->alloc);
++   /* Turnip pads an image's rows to its tiles (734 rows take 736 on an Adreno 618 or 650) where the allocator gives a
++    * buffer only the rows asked for: the image wouldn't fit. Then the frames go the usual way, copied by the X server,
++    * as they did before these buffers. */
++   if (probe_size < 0 || (uint64_t)probe_size < reqs.size) {
++      fprintf(stderr, "wsi: Android hardware buffers: %lld bytes for an image of %llu: frames copied instead\n",
++              (long long)probe_size, (unsigned long long)reqs.size);
++      wsi_destroy_image_info(chain, info);
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++   }
 +   fprintf(stderr, "wsi: Android hardware buffers of %ux%u, stride %u, usage 0x%llx\n", desc.width, desc.height,
 +           desc.stride, (unsigned long long)usage);
 +   return VK_SUCCESS;
@@ -249,7 +262,7 @@ index dbf65b2..ab39a1b 100644
  VkResult
  wsi_drm_configure_image(const struct wsi_swapchain *chain,
                          const VkSwapchainCreateInfoKHR *pCreateInfo,
-@@ -935,6 +1153,8 @@ wsi_drm_configure_image(const struct wsi_swapchain *chain,
+@@ -935,6 +1166,8 @@ wsi_drm_configure_image(const struct wsi_swapchain *chain,
                                         params,
                                         info);
     } else {
