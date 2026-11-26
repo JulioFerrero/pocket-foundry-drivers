@@ -1,0 +1,232 @@
+MobileGlues: every texture it makes is checked, and one it can't make is logged in full.
+
+A level the driver can't make was silent: MobileGlues' own error logging is on in debug builds only, and its
+glTexStorage2D read the driver's error away, so the game never learned either. On a Pixel 10's PowerVR three of the
+game's atlases were never made: their 28,000 uploads failed, and saving the fast start cache read one as 0 bytes and
+stopped the game (Pocket Foundry #65), with no line saying why. Now each glTexImage2D, glTexStorage2D and ASTC level
+is checked: one that fails is logged with its texture, size, levels, the format asked and the one made, the driver's
+error and how much was made before it, and the error goes back to the game; big ones made are logged too. A failing
+upload says how the driver has its level, its first three per texture in full, then a count every 1,000.
+
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -35,6 +35,8 @@
+ #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR 0x93D0
+ #endif
+ 
++extern "C" void mg_tex_made(const char*, GLenum, GLint, GLint, GLenum, GLenum, GLsizei, GLsizei, GLenum);
++
+ namespace {
+ 
+ #include "bc_astc_encoder.inc"
+@@ -322,6 +324,8 @@
+             GLES.glCompressedTexSubImage2D(job.target, job.level, job.x, job.y, job.width, job.height, job.astc, size,
+                                            offset);
+         const GLenum error = GLES.glGetError();
++        if (job.whole) mg_tex_made("an ASTC level with its blocks", job.target, job.level, 1, job.astc, job.astc,
++                                   job.width, job.height, error);
+         if (error != GL_NO_ERROR && failed++ < 3)
+             fprintf(stderr, "MobileGlues BC: ASTC upload %dx%d at %d,%d level %d of texture %u: GL error 0x%x\n",
+                     job.width, job.height, job.x, job.y, job.level, job.texture, error);
+@@ -373,7 +377,12 @@
+         if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         while (GLES.glGetError() != GL_NO_ERROR) {}
+         GLES.glCompressedTexImage2D(target, level, astc, width, height, 0, (GLsizei)((size_t)bw * bh * 16), nullptr);
+-        const bool made = GLES.glGetError() == GL_NO_ERROR;
++        const GLenum empty = GLES.glGetError();
++        const bool made = empty == GL_NO_ERROR;
++        // Not made empty is no failure yet: it's made next with its blocks, and logged there.
++        if (made) mg_tex_made("an empty ASTC level", target, level, 1, bc, astc, width, height, GL_NO_ERROR);
++        else fprintf(stderr, "MobileGlues BC: texture %u level %d, %dx%d: the driver won't make an empty ASTC level "
++                     "(GL error 0x%x): made with its blocks\n", (GLuint)texture, level, width, height, empty);
+         if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+         if (!made) {
+             const size_t before = encoded;
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -65,6 +65,8 @@
+ #define GL_BGRA 0x80E1
+ #endif
+ 
++extern "C" void mg_tex_made(const char*, GLenum, GLint, GLint, GLenum, GLenum, GLsizei, GLsizei, GLenum);
++
+ namespace {
+ 
+ struct Level {
+@@ -273,6 +275,35 @@
+     return (GLuint)id;
+ }
+ 
++// The bound texture's [level] as the driver has it, for the log: "0x0" for one never made.
++std::string driver_level(GLenum target, GLint level) {
++    GLint width = 0, height = 0, internal = 0;
++    GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &width);
++    GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &height);
++    GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_INTERNAL_FORMAT, &internal);
++    char out[96];
++    snprintf(out, sizeof(out), "%dx%d as 0x%x%s", width, height, internal, width ? "" : " (never made)");
++    return out;
++}
++
++// What MobileGlues has made of textures, by texture and level, in bytes: a texture that can't be made is logged
++// with how much was made before it. Kept apart from the shadows' lock: made from texture.cpp too.
++std::mutex made_lock;
++std::map<std::pair<GLuint, GLint>, size_t> made;
++size_t made_bytes = 0;
++
++size_t texture_bytes(GLenum format, GLsizei width, GLsizei height) {
++    const size_t w = (size_t)std::max(width, 1), h = (size_t)std::max(height, 1);
++    if (const int bb = block_bytes(format)) return (w + 3) / 4 * ((h + 3) / 4) * bb;
++    switch (format) {
++    case 0x93B0: case 0x93D0: return (w + 3) / 4 * ((h + 3) / 4) * 16;   // ASTC 4x4
++    case GL_R8: case GL_RED: return w * h;
++    case GL_RG8: case GL_RG: return w * h * 2;
++    case GL_RGB8: case GL_SRGB8: case GL_RGB: return w * h * 3;
++    default: return w * h * 4;
++    }
++}
++
+ // The upload's bytes, to [use]: from the bound unpack buffer at offset `data`, or from client memory. None for a
+ // level made empty.
+ void source(const void* data, size_t size, const std::function<void(const uint8_t*)>& use) {
+@@ -434,9 +465,17 @@
+     if (whole) GLES.glTexImage2D(target, level, storage, width, height, 0, client, GL_UNSIGNED_BYTE, pixels);
+     else if (pixels) GLES.glTexSubImage2D(target, level, x, y, width, height, client, GL_UNSIGNED_BYTE, pixels);
+     GLenum error = GLES.glGetError();
+-    if (error != GL_NO_ERROR)
+-        fprintf(stderr, "MobileGlues BC: decoded upload %dx%d at %d,%d level %d of texture %u (stored as 0x%x): "
+-                "GL error 0x%x\n", width, height, x, y, level, bound_2d(), storage, error);
++    if (whole) mg_tex_made("decoded level", target, level, 1, format, storage, width, height, error);
++    // Each texture's first three in full, with the level as the driver has it, then a count every 1,000: one
++    // texture that was never made fails every upload, 28,000 lines on a Pixel 10 that hid what went wrong.
++    static std::map<GLuint, size_t> failures;
++    if (error != GL_NO_ERROR && !whole) {
++        const size_t n = ++failures[bound_2d()];
++        if (n <= 3 || n % 1000 == 0)
++            fprintf(stderr, "MobileGlues BC: decoded upload %dx%d at %d,%d level %d of texture %u (stored as 0x%x): "
++                    "GL error 0x%x; the driver has the level %s; %zu of its uploads failed so far\n", width, height, x,
++                    y, level, bound_2d(), storage, error, driver_level(target, level).c_str(), n);
++    }
+     GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
+     GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+     GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+@@ -558,9 +597,10 @@
+     }
+     if (pname == GL_TEXTURE_COMPRESSED) *params = compressed ? GL_TRUE : GL_FALSE;
+     else *params = compressed ? (GLint)found->second.size : 0;
+-    fprintf(stderr, "MobileGlues BC: %s of texture %u level %d: %d\n",
++    fprintf(stderr, "MobileGlues BC: %s of texture %u level %d: %d%s%s\n",
+             pname == GL_TEXTURE_COMPRESSED ? "GL_TEXTURE_COMPRESSED" : "GL_TEXTURE_COMPRESSED_IMAGE_SIZE",
+-            target == GL_TEXTURE_2D ? bound_2d() : 0, level, *params);
++            target == GL_TEXTURE_2D ? bound_2d() : 0, level, *params, *params ? "" : "; the driver has the level ",
++            *params ? "" : driver_level(target, level).c_str());
+     return true;
+ }
+ 
+@@ -612,6 +652,14 @@
+ 
+ void mg_bc_forget(GLsizei n, const GLuint* textures) {
+     for (GLsizei i = 0; i < n; i++) mg_astc_flush_for(textures[i], -1);
++    {
++        std::lock_guard<std::mutex> guard(made_lock);
++        for (GLsizei i = 0; i < n; i++)
++            for (auto it = made.lower_bound({textures[i], -1}); it != made.end() && it->first.first == textures[i];) {
++                made_bytes -= it->second;
++                it = made.erase(it);
++            }
++    }
+     std::lock_guard<std::mutex> guard(lock);
+     for (GLsizei i = 0; i < n; i++)
+         for (auto it = shadows.lower_bound({textures[i], -1}); it != shadows.end() && it->first.first == textures[i];)
+@@ -654,6 +702,34 @@
+     GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+     if (unpack) return false;   // pixels is an offset into it: not empty
+     return mg_astc_upload(target, level, 0, 0, width, height, requested, nullptr, 0, true);
++}
++
++// A texture level the driver made, or couldn't ([error]), by [how]: logged when it failed or is big (16 MB and up),
++// with what MobileGlues made before it, so a report says which of the game's textures wasn't made and why (#65: a
++// Pixel 10's PowerVR left three atlases unmade and no line said so). [levels] for glTexStorage2D's, from [level].
++void mg_tex_made(const char* how, GLenum target, GLint level, GLint levels, GLenum requested, GLenum stored,
++                 GLsizei width, GLsizei height, GLenum error) {
++    const GLuint texture = target == GL_TEXTURE_2D ? bound_2d() : 0;
++    size_t bytes = 0;
++    for (GLint l = 0; l < std::max(levels, 1); l++) bytes += texture_bytes(stored, width >> l, height >> l);
++    size_t total, count;
++    {
++        std::lock_guard<std::mutex> guard(made_lock);
++        if (error == GL_NO_ERROR && texture) {
++            auto& slot = made[{texture, level}];
++            made_bytes += bytes - slot;
++            slot = bytes;
++        }
++        total = made_bytes;
++        count = made.size();
++    }
++    if (error == GL_NO_ERROR && bytes < (16u << 20)) return;
++    char failed[32] = "";
++    if (error != GL_NO_ERROR) snprintf(failed, sizeof(failed), ": GL error 0x%x", error);
++    fprintf(stderr, "MobileGlues: texture %u level %d %s by %s: %dx%d, %d level%s, as 0x%x (the game asked 0x%x), "
++            "%zu MB%s; %zu MB in %zu texture levels made so far\n", texture, level,
++            error == GL_NO_ERROR ? "made" : "NOT made", how, width, height, std::max(levels, 1), levels > 1 ? "s" : "",
++            stored, requested, bytes >> 20, failed, total >> 20, count);
+ }
+ 
+ void mg_bc_forget_level(GLenum target, GLint level) {
+--- a/MobileGlues-cpp/gl/texture.cpp
++++ b/MobileGlues-cpp/gl/texture.cpp
+@@ -886,6 +886,7 @@
+ extern "C" void mg_bc_storage_format(GLenum*);
+ extern "C" void mg_bc_image_format(GLint*, GLenum*, GLenum*, const void*);
+ extern "C" bool mg_bc_compressed_image(GLenum, GLint, GLint, GLsizei, GLsizei, const void*);
++extern "C" void mg_tex_made(const char*, GLenum, GLint, GLint, GLenum, GLenum, GLsizei, GLsizei, GLenum);
+ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid* pixels) {
+     mg_bc_forget_level(target, level);
+@@ -955,11 +956,16 @@
+ 
+     tex->format = format;
+ 
+-    // An empty BC level kept as ASTC is made there (bc_shadow.cpp).
+-    if (!mg_bc_compressed_image(target, level, requested, width, height, pixels))
++    // An empty BC level kept as ASTC is made there (bc_shadow.cpp). The driver's answer is logged when it fails or
++    // the level is big, and kept for the game, after any an earlier call left.
++    if (!mg_bc_compressed_image(target, level, requested, width, height, pixels)) {
++        const GLenum earlier = GLES.glGetError();
+         GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
+-
+-    CHECK_GL_ERROR
++        const GLenum error = GLES.glGetError();
++        mg_tex_made("glTexImage2D", target, level, 1, (GLenum)requested, (GLenum)internalFormat, width, height, error);
++        if (earlier != GL_NO_ERROR) mg_set_gl_error(earlier);
++        else if (error != GL_NO_ERROR) mg_set_gl_error(error);
++    }
+ }
+ 
+ void glTexImage3D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLsizei depth,
+@@ -1051,9 +1057,15 @@
+           "%d, height: %d",
+           target, levels, internalFormat, width, height)
+ 
++    const GLenum requested = internalFormat;
+     mg_bc_storage_format(&internalFormat);
+     internal_convert(&internalFormat, nullptr, nullptr, /*has_data=*/false);
++    const GLenum earlier = GLES.glGetError();
+     GLES.glTexStorage2D(target, levels, internalFormat, width, height);
++    const GLenum error = GLES.glGetError();
++    mg_tex_made("glTexStorage2D", target, 0, levels, requested, internalFormat, width, height, error);
++    if (earlier != GL_NO_ERROR) mg_set_gl_error(earlier);
++    else if (error != GL_NO_ERROR) mg_set_gl_error(error);
+ 
+     GET_TEXTURE_OBJECT(target);
+     tex->target = ConvertGLEnumToTextureTarget(target);
+@@ -1065,9 +1077,6 @@
+     tex->swizzle_param[1] = GL_GREEN;
+     tex->swizzle_param[2] = GL_BLUE;
+     tex->swizzle_param[3] = GL_ALPHA;
+-
+-    GLenum ERR = GLES.glGetError();
+-    if (ERR != GL_NO_ERROR) LOG_E("glTexStorage2D ERROR: %d", ERR)
+ }
+ 
+ void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat, GLsizei width, GLsizei height,

@@ -1,0 +1,277 @@
+MobileGlues: BC formats checked by drawing them, and every step that can crash logged first.
+
+A Pixel 10's PowerVR lists no S3TC in OpenGL ES, while its Vulkan driver samples BC, and the ASTC encoder that
+stood in for it crashed the driver's compiler on Android 16 (Pocket Foundry #65). Now each S3TC kind the driver
+doesn't list counts as native when a block of it, made as the game makes its atlases, draws as the CPU decodes it
+(BC1 there, not BC2), and listed RGTC counts only when it does too. The driver's name, version and extensions are
+logged, as is each check, and the encoder's compile and link before the driver takes them.
+
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -207,6 +207,9 @@
+     }
+     const std::string source = std::string(kHeader) + kAstcEncoder + kDecoder;
+     const char* text = source.c_str();
++    // Each step said before the driver takes it: a Pixel 10's PowerVR on Android 16 crashed in one, and nothing said
++    // which.
++    fprintf(stderr, "MobileGlues BC: the driver compiles the ASTC encoder (%zu characters of GLSL)\n", source.size());
+     GLuint shader = GLES.glCreateShader(GL_COMPUTE_SHADER);
+     GLES.glShaderSource(shader, 1, &text, nullptr);
+     GLES.glCompileShader(shader);
+@@ -221,6 +224,7 @@
+     }
+     GLuint program = GLES.glCreateProgram();
+     GLES.glAttachShader(program, shader);
++    fprintf(stderr, "MobileGlues BC: the driver links the ASTC encoder\n");
+     GLES.glLinkProgram(program);
+     GLES.glDeleteShader(shader);
+     GLES.glGetProgramiv(program, GL_LINK_STATUS, &ok);
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -163,37 +163,64 @@
+     return true;
+ }
+ 
+-// Whether OpenGL ES takes [format] as it is, from its extensions.
++bool drawn_right(GLenum format);
++
++// Whether OpenGL ES takes [format] as it is: from its extensions, and for S3TC and RGTC from drawing a block of each
++// (drawn_right). A Pixel 10's PowerVR lists no S3TC while its Vulkan driver samples BC, and on Android 16 it takes
++// BC1 and draws it right, but not BC2: each kind it doesn't list counts on its own when it draws right, and RGTC it
++// lists only when it does.
+ bool native(GLenum format) {
+     static int s3tc = -1, s3tc_srgb, rgtc, bptc;
++    static const GLenum kinds[4] = {GL_COMPRESSED_RGB_S3TC_DXT1_EXT, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
++                                    GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT};
++    static bool drawn[4];   // each of kinds[], not listed and drawn right
+     if (s3tc < 0) {
+         s3tc = s3tc_srgb = rgtc = bptc = 0;
+         const char* force = getenv("MG_BC_DECODE");
++        const bool forced = force && (!strcmp(force, "1") || !strcmp(force, "astc"));
+         GLint count = 0;
+         GLES.glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+-        for (GLint i = 0; i < count && !(force && (!strcmp(force, "1") || !strcmp(force, "astc"))); i++) {
++        std::string all;
++        for (GLint i = 0; i < count; i++) {
+             const char* name = (const char*)GLES.glGetStringi(GL_EXTENSIONS, i);
+             if (!name) continue;
++            all += all.empty() ? name : std::string(" ") + name;
++            if (forced) continue;
+             if (!strcmp(name, "GL_EXT_texture_compression_s3tc")) s3tc = 1;
+             else if (!strcmp(name, "GL_EXT_texture_compression_s3tc_srgb")) s3tc_srgb = 1;
+             else if (!strcmp(name, "GL_EXT_texture_compression_rgtc")) rgtc = 1;
+             else if (!strcmp(name, "GL_EXT_texture_compression_bptc")) bptc = 1;
+         }
++        const char* renderer = (const char*)GLES.glGetString(GL_RENDERER);
++        const char* version = (const char*)GLES.glGetString(GL_VERSION);
++        fprintf(stderr, "MobileGlues BC: %s, %s; %d extensions: %s\n", renderer ? renderer : "?",
++                version ? version : "?", count, all.c_str());
++        std::string unlisted;
++        for (int i = 0; i < 4 && !forced && !s3tc; i++) {
++            drawn[i] = drawn_right(kinds[i]);
++            if (drawn[i]) unlisted += std::string(unlisted.empty() ? " (not listed, drawn right: " : ", ") +
++                                      (i == 0 ? "BC1" : i == 1 ? "BC1 with alpha" : i == 2 ? "BC2" : "BC3");
++        }
++        if (!unlisted.empty()) unlisted += ")";
++        if (rgtc) rgtc = drawn_right(GL_COMPRESSED_RED_RGTC1) && drawn_right(GL_COMPRESSED_RG_RGTC2);
+         GLint max_size = 0, fb_width = 0, fb_height = 0, renderbuffer = 0;
+         GLES.glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
+         GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH, &fb_width);
+         GLES.glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT, &fb_height);
+         GLES.glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &renderbuffer);
+-        fprintf(stderr, "MobileGlues BC: S3TC %s, RGTC %s, BPTC %s (else ASTC or decoded); textures up to %d, "
+-                "framebuffers %dx%d, renderbuffers %d\n", s3tc ? "native" : "no", rgtc ? "native" : "no",
+-                bptc ? "native" : "no", max_size, fb_width, fb_height, renderbuffer);
++        fprintf(stderr, "MobileGlues BC: S3TC %s%s, RGTC %s, BPTC %s (else ASTC or decoded); textures up to %d, "
++                "framebuffers %dx%d, renderbuffers %d\n", s3tc ? "native" : "no", unlisted.c_str(),
++                rgtc ? "native" : "no", bptc ? "native" : "no", max_size, fb_width, fb_height, renderbuffer);
+     }
+     switch (format) {
+     case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
++        return s3tc || drawn[0];
+     case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
++        return s3tc || drawn[1];
+     case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
++        return s3tc || drawn[2];
+     case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+-        return s3tc;
++        return s3tc || drawn[3];
+     case GL_COMPRESSED_SRGB_S3TC_DXT1_EXT:
+     case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
+     case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
+@@ -425,6 +452,175 @@
+         }
+     }
+     return true;
++}
++
++// A 4x4 block of [format] made into a texture, drawn into a 4x4 RGBA8 framebuffer and read back: right when each
++// texel is within 8 of what decode() makes of it (GPUs round BC's in-between colours each their own way). Logged
++// either way, with the first wrong texel. The context's state is put back.
++bool drawn_right(GLenum format) {
++    // Every index of each block used, its colours far apart: a red-green BC1, a blue-yellow one with transparent
++    // texels, red-blue under BC2's sixteen alphas, green-blue under BC3's eight, and BC4's eight reds and greens.
++    static const uint8_t colour_rg[8] = {0x00, 0xF8, 0xE0, 0x07, 0xE4, 0x1B, 0x4E, 0xB1};
++    static const uint8_t colour_by[8] = {0x1F, 0x00, 0xE0, 0xFF, 0xE4, 0x1B, 0x4E, 0xB1};
++    static const uint8_t colour_rb[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0x1B, 0x4E, 0xB1};
++    static const uint8_t colour_gb[8] = {0xE0, 0x07, 0x1F, 0x00, 0x1B, 0xE4, 0xB1, 0x4E};
++    static const uint8_t alpha_bc2[8] = {0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE};
++    static const uint8_t ramp[8] = {0xFF, 0x00, 0x88, 0xC6, 0xFA, 0x88, 0xC6, 0xFA};
++    static const uint8_t ramp_down[8] = {0x10, 0xE0, 0xFA, 0x88, 0xC6, 0xFA, 0x88, 0xC6};
++    std::vector<uint8_t> block;
++    const char* name = "?";
++    auto add = [&](const uint8_t* bytes) { block.insert(block.end(), bytes, bytes + 8); };
++    switch (format) {
++    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT: name = "BC1"; add(colour_rg); break;
++    case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: name = "BC1 with alpha"; add(colour_by); break;
++    case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT: name = "BC2"; add(alpha_bc2); add(colour_rb); break;
++    case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: name = "BC3"; add(ramp); add(colour_gb); break;
++    case GL_COMPRESSED_RED_RGTC1: name = "BC4"; add(ramp); break;
++    case GL_COMPRESSED_RG_RGTC2: name = "BC5"; add(ramp); add(ramp_down); break;
++    default: return false;
++    }
++    Level l;
++    l.format = format;
++    l.width = l.height = 4;
++    std::vector<uint8_t> expected;
++    if (!decode(l, block, expected)) return false;
++
++    // The state this changes.
++    GLint framebuffer = 0, read_framebuffer = 0, program = 0, texture = 0, active = 0, vertex_array = 0, unpack = 0,
++          pack = 0, pack_alignment = 4, viewport[4] = {};
++    GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
++    GLES.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
++    GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
++    GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++    GLES.glActiveTexture(GL_TEXTURE0);
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertex_array);
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    GLES.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    GLES.glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
++    GLES.glGetIntegerv(GL_VIEWPORT, viewport);
++    const GLenum switches[] = {GL_BLEND, GL_SCISSOR_TEST, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_CULL_FACE,
++                               GL_RASTERIZER_DISCARD};
++    GLboolean was[6];
++    for (int i = 0; i < 6; i++) {
++        was[i] = GLES.glIsEnabled(switches[i]);
++        if (was[i]) GLES.glDisable(switches[i]);
++    }
++    const GLenum earlier = GLES.glGetError();
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++
++    std::string result;
++    GLuint tex = 0, target = 0, fbo = 0, vao = 0, prog = 0;
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    GLES.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    GLES.glGenTextures(1, &tex);
++    GLES.glBindTexture(GL_TEXTURE_2D, tex);
++    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    // Made as the game makes its atlases, storage then blocks, and as an empty level, as glTexImage2D's are.
++    auto failed = [&](const char* what) {
++        const GLenum error = GLES.glGetError();
++        if (error == GL_NO_ERROR || !result.empty()) return;
++        char text[96];
++        snprintf(text, sizeof text, "the driver won't %s (GL error 0x%x)", what, error);
++        result = text;
++    };
++    GLES.glTexStorage2D(GL_TEXTURE_2D, 1, format, 4, 4);
++    failed("make storage of it");
++    if (result.empty()) {
++        GLES.glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, format, (GLsizei)block.size(), block.data());
++        failed("take its blocks");
++    }
++    if (result.empty()) {
++        GLuint empty = 0;
++        GLES.glGenTextures(1, &empty);
++        GLES.glBindTexture(GL_TEXTURE_2D, empty);
++        GLES.glCompressedTexImage2D(GL_TEXTURE_2D, 0, format, 4, 4, 0, (GLsizei)block.size(), nullptr);
++        failed("make an empty level of it");
++        GLES.glDeleteTextures(1, &empty);
++    }
++    GLenum error = GL_NO_ERROR;
++    if (result.empty()) {
++        GLES.glGenTextures(1, &target);
++        GLES.glBindTexture(GL_TEXTURE_2D, target);
++        GLES.glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 4, 4);
++        GLES.glGenFramebuffers(1, &fbo);
++        GLES.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++        GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
++        if (GLES.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) result = "no framebuffer to draw it in";
++    }
++    if (result.empty()) {
++        static const char* vertex = "#version 300 es\n"
++            "void main() { gl_Position = vec4(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0,"
++            " 0.0, 1.0); }\n";
++        static const char* fragment = "#version 300 es\nprecision highp float;\nuniform highp sampler2D t;\n"
++            "out vec4 c;\nvoid main() { c = texelFetch(t, ivec2(gl_FragCoord.xy), 0); }\n";
++        GLuint shaders[2] = {GLES.glCreateShader(GL_VERTEX_SHADER), GLES.glCreateShader(GL_FRAGMENT_SHADER)};
++        const char* sources[2] = {vertex, fragment};
++        prog = GLES.glCreateProgram();
++        for (int i = 0; i < 2; i++) {
++            GLES.glShaderSource(shaders[i], 1, &sources[i], nullptr);
++            GLES.glCompileShader(shaders[i]);
++            GLES.glAttachShader(prog, shaders[i]);
++        }
++        GLES.glLinkProgram(prog);
++        for (GLuint shader : shaders) GLES.glDeleteShader(shader);
++        GLint linked = 0;
++        GLES.glGetProgramiv(prog, GL_LINK_STATUS, &linked);
++        if (!linked) result = "its program didn't link";
++    }
++    if (result.empty()) {
++        GLES.glUseProgram(prog);
++        GLES.glUniform1i(GLES.glGetUniformLocation(prog, "t"), 0);
++        GLES.glBindTexture(GL_TEXTURE_2D, tex);
++        GLES.glGenVertexArrays(1, &vao);
++        GLES.glBindVertexArray(vao);
++        GLES.glViewport(0, 0, 4, 4);
++        GLES.glDrawArrays(GL_TRIANGLES, 0, 3);
++        uint8_t drawn[64] = {};
++        GLES.glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        GLES.glReadPixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, drawn);
++        error = GLES.glGetError();
++        if (error != GL_NO_ERROR) {
++            char text[64];
++            snprintf(text, sizeof text, "drawing it failed (GL error 0x%x)", error);
++            result = text;
++        }
++        for (int t = 0; t < 16 && result.empty(); t++) {
++            for (int c = 0; c < 4; c++) {
++                if (abs((int)drawn[t * 4 + c] - (int)expected[t * 4 + c]) <= 8) continue;
++                char text[160];
++                snprintf(text, sizeof text, "it draws wrong: texel %d is %d,%d,%d,%d where it's %d,%d,%d,%d", t,
++                         drawn[t * 4], drawn[t * 4 + 1], drawn[t * 4 + 2], drawn[t * 4 + 3], expected[t * 4],
++                         expected[t * 4 + 1], expected[t * 4 + 2], expected[t * 4 + 3]);
++                result = text;
++                break;
++            }
++        }
++    }
++    const bool right = result.empty();
++    fprintf(stderr, "MobileGlues BC: %s, drawn by the driver: %s\n", name, right ? "right" : result.c_str());
++
++    GLES.glBindVertexArray((GLuint)vertex_array);
++    if (vao) GLES.glDeleteVertexArrays(1, &vao);
++    GLES.glUseProgram((GLuint)program);
++    if (prog) GLES.glDeleteProgram(prog);
++    GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)framebuffer);
++    GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_framebuffer);
++    if (fbo) GLES.glDeleteFramebuffers(1, &fbo);
++    GLuint textures[2] = {tex, target};
++    GLES.glDeleteTextures(2, textures);
++    GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
++    GLES.glActiveTexture((GLenum)active);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++    GLES.glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    GLES.glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
++    GLES.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    for (int i = 0; i < 6; i++)
++        if (was[i]) GLES.glEnable(switches[i]);
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    if (earlier != GL_NO_ERROR) mg_set_gl_error(earlier);
++    return right;
+ }
+ 
+ // [blocks], a [width]x[height] rectangle of [format], decoded into the bound texture's [level] at x, y, with the

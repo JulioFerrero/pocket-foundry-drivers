@@ -37,7 +37,12 @@
       "patches/mobileglues-bc-read-back.patch",
       "patches/mobileglues-discard-new-storage.patch",
       "patches/mobileglues-bc-as-astc.patch",
-      "patches/mobileglues-gl-4.1.patch"
+      "patches/mobileglues-gl-4.1.patch",
+      "patches/mobileglues-texture-log.patch",
+      "patches/mobileglues-native-bc-empty-levels.patch",
+      "patches/mobileglues-bc-drawn-check.patch",
+      "patches/mobileglues-astc-encoder-by-name.patch",
+      "patches/mobileglues-astc-buffer-uploads.patch"
     ],
     "licences": [
       "LICENSE",

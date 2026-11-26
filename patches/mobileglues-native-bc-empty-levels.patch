@@ -1,0 +1,68 @@
+MobileGlues: an empty level of a compressed format the driver has is made with glCompressedTexImage2D.
+
+Factorio makes an empty atlas with glTexImage2D and fills it with glCompressedTexSubImage2D. Where the driver lacks
+the BC format, MobileGlues makes it ASTC or uncompressed; where the driver has it (BC4 and BC5 on a Pixel 10's
+PowerVR, "RGTC native") it passed glTexImage2D through with the compressed format, which OpenGL ES's glTexImage2D
+doesn't take: GL_INVALID_ENUM, the atlas was never made, every fill failed and saving the fast start cache stopped
+the game (Pocket Foundry #65). Now it's made with glCompressedTexImage2D, empty, or with zeros where the driver wants
+blocks; a driver that won't make it at all gets it uncompressed, its fills decoded. One the game gives pixels for is
+made uncompressed: nothing here compresses them.
+
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -668,9 +668,10 @@
+ 
+ // glTexImage2D's formats: Factorio makes an empty BC atlas with glTexImage2D and fills it with
+ // glCompressedTexSubImage2D. Where the driver lacks that BC format it's made uncompressed, in the channels the game
+-// passes, and the fills decode into it.
++// passes, and the fills decode into it. So is one the driver has but the game gives pixels for: OpenGL ES's
++// glTexImage2D takes no compressed format, and nothing here compresses them (an empty one: mg_bc_compressed_image).
+ void mg_bc_image_format(GLint* internalformat, GLenum* format, GLenum* type, const void* pixels) {
+-    if (!block_bytes(*internalformat) || native(*internalformat)) return;
++    if (!block_bytes(*internalformat) || (native(*internalformat) && !pixels)) return;
+     switch (*format) {
+     case GL_RED: *internalformat = GL_R8; break;
+     case GL_RG: *internalformat = GL_RG8; break;
+@@ -693,15 +694,38 @@
+     *internalformat = astc ? astc : decoded_storage(*internalformat);
+ }
+ 
+-// glTexImage2D of an empty level of a BC format [requested] that's kept as ASTC: made here, transparent. False leaves
+-// the level to the driver, as mg_bc_image_format made it.
++// glTexImage2D of an empty level of a BC format [requested]: kept as ASTC, made here, transparent; one the driver has
++// (BC4 and BC5 on a Pixel 10's PowerVR), made with glCompressedTexImage2D, as OpenGL ES's glTexImage2D takes no
++// compressed format: there it failed with GL_INVALID_ENUM, the atlas was never made and the game stopped (#65). A
++// driver that won't make it empty gets it uncompressed, and the fills decode into it. False leaves the level to the
++// driver, as mg_bc_image_format made it.
+ bool mg_bc_compressed_image(GLenum target, GLint level, GLint requested, GLsizei width, GLsizei height,
+                             const void* pixels) {
+-    if (target != GL_TEXTURE_2D || pixels || !block_bytes(requested) || !astc_storage(requested)) return false;
++    if (target != GL_TEXTURE_2D || pixels || !block_bytes(requested)) return false;
+     GLint unpack = 0;
+     GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+     if (unpack) return false;   // pixels is an offset into it: not empty
+-    return mg_astc_upload(target, level, 0, 0, width, height, requested, nullptr, 0, true);
++    if (astc_storage(requested)) return mg_astc_upload(target, level, 0, 0, width, height, requested, nullptr, 0, true);
++    if (!native(requested)) return false;
++    const GLsizei size = (GLsizei)(((size_t)width + 3) / 4 * (((size_t)height + 3) / 4) * block_bytes(requested));
++    const GLenum earlier = GLES.glGetError();
++    GLES.glCompressedTexImage2D(target, level, requested, width, height, 0, size, nullptr);
++    GLenum error = GLES.glGetError();
++    if (error != GL_NO_ERROR) {
++        // Some drivers want the blocks: zeros, which are transparent black.
++        std::vector<uint8_t> zeros((size_t)size);
++        GLES.glCompressedTexImage2D(target, level, requested, width, height, 0, size, zeros.data());
++        error = GLES.glGetError();
++    }
++    mg_tex_made("an empty compressed level", target, level, 1, (GLenum)requested, (GLenum)requested, width, height,
++                error);
++    if (error != GL_NO_ERROR) {
++        // Uncompressed, as where the driver lacks the format: its uploads decode into it.
++        std::vector<uint8_t> none;
++        upload_decoded(target, level, 0, 0, width, height, (GLenum)requested, none, true);
++    }
++    if (earlier != GL_NO_ERROR) mg_set_gl_error(earlier);
++    return true;
+ }
+ 
+ // A texture level the driver made, or couldn't ([error]), by [how]: logged when it failed or is big (16 MB and up),

@@ -1,0 +1,265 @@
+MobileGlues: the encoded ASTC blocks uploaded from memory where uploads from a buffer land wrong.
+
+A Pixel 10's PowerVR drew the sprites the encoder made with their blocks scrambled (Pocket Foundry #65): its
+compressed uploads from a pixel unpack buffer land in the wrong places, in every level size tried from 2048x2048 to
+16384x256, where the same blocks uploaded from memory land right. Where the encoder is first built, blocks that each
+say where they belong are uploaded from a buffer into a level as wide as the game's atlases and drawn back; where one
+lands wrong, that's logged, and each batch's encoded blocks are read back and uploaded from memory.
+
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -11,6 +11,7 @@
+ #include "bc_astc.h"
+ #include "../egl/context.h"
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <atomic>
+ #include <map>
+@@ -243,6 +244,185 @@
+     return true;
+ }
+ 
++
++// Whether the driver puts compressed blocks uploaded from a pixel unpack buffer where they belong: checked once, where
++// the encoder is first built. A Pixel 10's PowerVR put them in the wrong places in every level size tried, where the
++// same blocks uploaded from memory landed right. -1 not checked, 0 they land wrong, 1 right.
++std::atomic<int> buffer_uploads{-1};
++
++// A block's colour: its place's number, column and row, so a block drawn elsewhere says where it came from.
++void place_rgb(int place, int bx, int by, uint8_t* o) {
++    const int c = (((place << 2) | (by & 3)) << 11) | ((bx & 63) << 5) | ((by >> 2) & 31);
++    const int r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
++    o[0] = (uint8_t)(r << 3 | r >> 2);
++    o[1] = (uint8_t)(g << 2 | g >> 4);
++    o[2] = (uint8_t)(b << 3 | b >> 2);
++}
++
++// [w]x[h] texels of [texture] from x0,y0, drawn into an RGBA8 framebuffer and read back into [rgba]; the context's
++// state put back.
++bool draw_back(GLuint texture, int x0, int y0, int w, int h, std::vector<uint8_t>& rgba, std::string& why) {
++    GLint framebuffer = 0, read_framebuffer = 0, program = 0, bound = 0, active = 0, vertex_array = 0, pack = 0,
++          pack_alignment = 4, viewport[4] = {};
++    GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
++    GLES.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_framebuffer);
++    GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
++    GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++    GLES.glActiveTexture(GL_TEXTURE0);
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++    GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertex_array);
++    GLES.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    GLES.glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
++    GLES.glGetIntegerv(GL_VIEWPORT, viewport);
++    const GLenum switches[] = {GL_BLEND, GL_SCISSOR_TEST, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_CULL_FACE,
++                               GL_RASTERIZER_DISCARD};
++    GLboolean was[6];
++    for (int i = 0; i < 6; i++) {
++        was[i] = GLES.glIsEnabled(switches[i]);
++        if (was[i]) GLES.glDisable(switches[i]);
++    }
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    static const char* vertex = "#version 300 es\n"
++        "void main() { gl_Position = vec4(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0,"
++        " 0.0, 1.0); }\n";
++    static const char* fragment = "#version 300 es\nprecision highp float;\nuniform highp sampler2D t;\n"
++        "uniform ivec2 o;\nout vec4 c;\nvoid main() { c = texelFetch(t, o + ivec2(gl_FragCoord.xy), 0); }\n";
++    GLuint shaders[2] = {GLES.glCreateShader(GL_VERTEX_SHADER), GLES.glCreateShader(GL_FRAGMENT_SHADER)};
++    const char* sources[2] = {vertex, fragment};
++    GLuint prog = GLES.glCreateProgram();
++    for (int i = 0; i < 2; i++) {
++        GLES.glShaderSource(shaders[i], 1, &sources[i], nullptr);
++        GLES.glCompileShader(shaders[i]);
++        GLES.glAttachShader(prog, shaders[i]);
++    }
++    GLES.glLinkProgram(prog);
++    for (GLuint shader : shaders) GLES.glDeleteShader(shader);
++    GLuint target = 0, fbo = 0, vao = 0;
++    GLES.glGenTextures(1, &target);
++    GLES.glBindTexture(GL_TEXTURE_2D, target);
++    GLES.glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
++    GLES.glGenFramebuffers(1, &fbo);
++    GLES.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++    GLES.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
++    GLES.glUseProgram(prog);
++    GLES.glUniform1i(GLES.glGetUniformLocation(prog, "t"), 0);
++    GLES.glUniform2i(GLES.glGetUniformLocation(prog, "o"), x0, y0);
++    GLES.glBindTexture(GL_TEXTURE_2D, texture);
++    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    GLES.glGenVertexArrays(1, &vao);
++    GLES.glBindVertexArray(vao);
++    GLES.glViewport(0, 0, w, h);
++    GLES.glDrawArrays(GL_TRIANGLES, 0, 3);
++    rgba.assign((size_t)w * h * 4, 0);
++    GLES.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    GLES.glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    GLES.glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
++    const GLenum error = GLES.glGetError();
++    if (error != GL_NO_ERROR) {
++        char text[48];
++        snprintf(text, sizeof text, "GL error 0x%x drawing it", error);
++        why = text;
++    }
++    GLES.glBindVertexArray((GLuint)vertex_array);
++    GLES.glDeleteVertexArrays(1, &vao);
++    GLES.glUseProgram((GLuint)program);
++    GLES.glDeleteProgram(prog);
++    GLES.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)framebuffer);
++    GLES.glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_framebuffer);
++    GLES.glDeleteFramebuffers(1, &fbo);
++    GLES.glDeleteTextures(1, &target);
++    GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++    GLES.glActiveTexture((GLenum)active);
++    GLES.glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    GLES.glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
++    GLES.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    for (int i = 0; i < 6; i++)
++        if (was[i]) GLES.glEnable(switches[i]);
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    return error == GL_NO_ERROR;
++}
++
++// Whether ASTC blocks uploaded from a buffer, at offsets in it as the encoder's are, land where they should in a
++// [W]x[H] level: a strip as wide as the level two block rows down, and two rectangles where the game puts sprites,
++// drawn back. [detail]: the first block that didn't, and where it came from.
++bool buffer_uploads_land(int W, int H, std::string& detail) {
++    struct Place { int x, y, w, h; };
++    const Place places[3] = {{0, 8, W, 8}, {4, 32, 8, 8}, {W / 2 + 4, 64, 140, 108}};
++    GLint bound = 0, unpack = 0;
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    GLuint texture = 0, buffer = 0;
++    GLES.glGenTextures(1, &texture);
++    GLES.glBindTexture(GL_TEXTURE_2D, texture);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    GLES.glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_ASTC_4x4_KHR, W, H, 0,
++                                (GLsizei)((size_t)(W / 4) * (H / 4) * 16), nullptr);
++    bool right = GLES.glGetError() == GL_NO_ERROR;
++    if (!right) detail = "the level wasn't made";
++    // Each block one colour, as an ASTC void-extent block.
++    std::vector<uint8_t> blocks;
++    size_t offsets[3];
++    for (int i = 0; i < 3; i++) {
++        offsets[i] = blocks.size() + 16;
++        blocks.resize(offsets[i]);
++        for (int by = 0; by < places[i].h / 4; by++) {
++            for (int bx = 0; bx < places[i].w / 4; bx++) {
++                uint8_t rgb[3];
++                place_rgb(i, bx, by, rgb);
++                const uint32_t words[4] = {0xfffffdfcu, 0xffffffffu, rgb[0] * 257u | (rgb[1] * 257u) << 16,
++                                           rgb[2] * 257u | 0xffffu << 16};
++                blocks.insert(blocks.end(), (const uint8_t*)words, (const uint8_t*)words + 16);
++            }
++        }
++    }
++    GLES.glGenBuffers(1, &buffer);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer);
++    GLES.glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)blocks.size(), blocks.data(), GL_STATIC_DRAW);
++    for (int i = 0; i < 3 && right; i++) {
++        const Place& p = places[i];
++        GLES.glCompressedTexSubImage2D(GL_TEXTURE_2D, 0, p.x, p.y, p.w, p.h, GL_COMPRESSED_RGBA_ASTC_4x4_KHR,
++                                       (GLsizei)((size_t)(p.w / 4) * (p.h / 4) * 16), (const void*)offsets[i]);
++        const GLenum error = GLES.glGetError();
++        if (error != GL_NO_ERROR) {
++            char text[64];
++            snprintf(text, sizeof text, "an upload gave GL error 0x%x", error);
++            detail = text;
++            right = false;
++        }
++    }
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    GLES.glDeleteBuffers(1, &buffer);
++    for (int i = 0; i < 3 && right; i++) {
++        const Place& p = places[i];
++        std::vector<uint8_t> drawn;
++        if (!draw_back(texture, p.x, p.y, p.w, p.h, drawn, detail)) {
++            right = false;
++            break;
++        }
++        for (int by = 0; by < p.h / 4 && right; by++) {
++            for (int bx = 0; bx < p.w / 4 && right; bx++) {
++                const uint8_t* g = drawn.data() + ((size_t)(by * 4 + 1) * p.w + bx * 4 + 1) * 4;
++                uint8_t want[3];
++                place_rgb(i, bx, by, want);
++                if (abs(g[0] - want[0]) <= 2 && abs(g[1] - want[1]) <= 2 && abs(g[2] - want[2]) <= 2) continue;
++                const int r5 = g[0] >> 3;
++                char text[200];
++                snprintf(text, sizeof text, "block %d,%d of %dx%d at %d,%d shows %d,%d,%d,%d (place %d's block %d,%d "
++                         "mod 64,128)", bx, by, p.w, p.h, p.x, p.y, g[0], g[1], g[2], g[3], r5 >> 2, g[1] >> 2,
++                         ((g[2] >> 3) << 2) | (r5 & 3));
++                detail = text;
++                right = false;
++            }
++        }
++    }
++    GLES.glDeleteTextures(1, &texture);
++    GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    return right;
++}
+ } // namespace
+ 
+ GLenum mg_astc_for(GLenum bc) {
+@@ -264,7 +444,18 @@
+ 
+ bool mg_astc_ready() {
+     Encoder& encoder = current();
+-    if (encoder.ready < 0) encoder.ready = build(encoder);
++    if (encoder.ready < 0) {
++        encoder.ready = build(encoder);
++        if (encoder.ready && buffer_uploads < 0) {
++            std::string detail;
++            buffer_uploads = buffer_uploads_land(8192, 512, detail);
++            if (buffer_uploads)
++                fprintf(stderr, "MobileGlues BC: compressed uploads from a buffer land right\n");
++            else
++                fprintf(stderr, "MobileGlues BC: compressed uploads from a buffer land wrong in a 8192x512 level (%s), "
++                        "so the encoded blocks are uploaded from memory\n", detail.c_str());
++        }
++    }
+     return encoder.ready;
+ }
+ 
+@@ -306,6 +497,23 @@
+         GLES.glDispatchCompute((job.bw + 7) / 8, (job.bh + 7) / 8, 1);
+     }
+     GLES.glMemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
++    // Where the driver puts blocks uploaded from a buffer in the wrong places (buffer_uploads), the encoded blocks read
++    // back and uploaded from memory.
++    std::vector<uint8_t> read_back;
++    if (buffer_uploads == 0) {
++        GLES.glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++        const void* mapped = GLES.glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(blocks * 16),
++                                                   GL_MAP_READ_BIT);
++        if (mapped) {
++            read_back.assign((const uint8_t*)mapped, (const uint8_t*)mapped + blocks * 16);
++            GLES.glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
++        } else {
++            static int unread = 0;
++            if (unread++ < 3)
++                fprintf(stderr, "MobileGlues BC: the encoded blocks couldn't be read back (GL error 0x%x), so they're "
++                        "uploaded from the buffer\n", GLES.glGetError());
++        }
++    }
+ 
+     // The game's bindings back before the uploads: an Adreno refuses (GL_INVALID_OPERATION) a compressed upload from
+     // a buffer that's still bound as a storage buffer.
+@@ -315,13 +523,14 @@
+         else GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, (GLuint)bound[i]);
+     }
+     GLES.glBindBuffer(GL_SHADER_STORAGE_BUFFER, (GLuint)storage);
+-    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, encoder.out);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, read_back.empty() ? encoder.out : 0);
+     GLuint bound_texture = (GLuint)texture;
+     size_t failed = 0;
+     for (const Job& job : jobs) {
+         if (job.texture != bound_texture) GLES.glBindTexture(GL_TEXTURE_2D, bound_texture = job.texture);
+         const GLsizei size = (GLsizei)job.bw * (GLsizei)job.bh * 16;
+-        const void* offset = (const void*)(job.dst_block * 16);
++        const void* offset =
++            read_back.empty() ? (const void*)(job.dst_block * 16) : read_back.data() + job.dst_block * 16;
+         if (job.whole)
+             GLES.glCompressedTexImage2D(job.target, job.level, job.astc, job.width, job.height, 0, size, offset);
+         else
