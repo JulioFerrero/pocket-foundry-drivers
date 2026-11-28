@@ -43,7 +43,8 @@
       "patches/mobileglues-bc-drawn-check.patch",
       "patches/mobileglues-astc-encoder-by-name.patch",
       "patches/mobileglues-astc-buffer-uploads.patch",
-      "patches/mobileglues-bc4-bc5-as-eac.patch"
+      "patches/mobileglues-bc4-bc5-as-eac.patch",
+      "patches/mobileglues-encoder-batches.patch"
     ],
     "licences": [
       "LICENSE",
