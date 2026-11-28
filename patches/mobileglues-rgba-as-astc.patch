@@ -1,0 +1,426 @@
+MobileGlues: big RGBA textures, the game's icons, kept as ASTC 4x4, a quarter of the memory.
+
+Prototype. Factorio keeps its icons uncompressed: an RGBA8 atlas 8192 wide and its mipmaps, made empty and filled from
+memory, a sprite at a time anywhere, never drawn into (Xiaomi 12T, base game: 8192x2592 and 3 levels, 113 MB). A
+texture 4096 wide or more, made empty with glTexImage2D, is kept as ASTC 4x4 from its first upload (the game also
+makes a 4096x4096 RGBA texture it only draws into): each upload goes into an RGBA copy on storage beside the BC ones,
+and the 4x4 blocks it touches are encoded again, from the upload itself where it covers whole blocks, else from the
+copy, 64 rows at a time. Read back, a level is the copy; asked, it's the game's RGBA8. One a framebuffer takes after
+all goes back to RGBA from its copy. MG_RGBA_ASTC=0 leaves them RGBA.
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -59,7 +59,8 @@
+ #include "bc_astc_encoder.inc"
+ 
+ // One invocation a 4x4 block. u_kind: BC1 without alpha (0) or with (1), BC2 (2) or BC3 (3) as ASTC 4x4, BC4 as EAC
+-// R11 (4) or BC5 as EAC RG11 (5). Empty levels don't come here (empty_level). u_region: for a level kept at half the
++// R11 (4) or BC5 as EAC RG11 (5), or the game's RGBA8 as ASTC 4x4 (6), 16 texels a block, row-major. Empty levels don't
++// come here (empty_level). u_region: for a level kept at half the
+ // game's size (MG_BC_HALF), the game blocks the job's region has, across and down: each block made is the average of
+ // the 2x2 of them under it (the sprites are premultiplied, so a plain average); else 0.
+ const char kHeader[] = R"GLSL(#version 310 es
+@@ -314,18 +315,27 @@
+     }
+     /* ASTC: one call each to the decoder and the encoder, which the driver's compiler copies wherever they're called
+      * (a second ASTC encoder took a Mali-G610 1.2 s and 300 MB more to compile, as the game started) */
+-    uint words = u_kind < 2u ? 2u : 4u;
+-    ivec4 sum[16];
+-    for (uint t = 0u; t < 16u; t++) sum[t] = ivec4(0);
+-    for (uint q = 0u; q < (halved ? 4u : 1u); q++) {
+-        uvec2 d = uvec2(q & 1u, q >> 1u);
+-        decode_bc(halved ? src_block(2u * at + d, words) : u_src + words * i);
+-        for (uint t = 0u; t < 16u && halved; t++) {
+-            uint k = (2u * d.y + ((t >> 2u) >> 1u)) * 4u + 2u * d.x + ((t & 3u) >> 1u);
+-            sum[k] += g_px[t];
++    uint words = u_kind == 6u ? 16u : (u_kind < 2u ? 2u : 4u);
++    if (u_kind == 6u) {
++        /* RGBA8: the icons, which the game keeps uncompressed */
++        uint s = u_src + 16u * i;
++        for (uint t = 0u; t < 16u; t++) {
++            uint w = src.w[s + t];
++            g_px[t] = ivec4(int(w & 255u), int((w >> 8) & 255u), int((w >> 16) & 255u), int(w >> 24));
++        }
++    } else {
++        ivec4 sum[16];
++        for (uint t = 0u; t < 16u; t++) sum[t] = ivec4(0);
++        for (uint q = 0u; q < (halved ? 4u : 1u); q++) {
++            uvec2 d = uvec2(q & 1u, q >> 1u);
++            decode_bc(halved ? src_block(2u * at + d, words) : u_src + words * i);
++            for (uint t = 0u; t < 16u && halved; t++) {
++                uint k = (2u * d.y + ((t >> 2u) >> 1u)) * 4u + 2u * d.x + ((t & 3u) >> 1u);
++                sum[k] += g_px[t];
++            }
+         }
++        for (uint t = 0u; t < 16u && halved; t++) g_px[t] = (sum[t] + 2) / 4;
+     }
+-    for (uint t = 0u; t < 16u && halved; t++) g_px[t] = (sum[t] + 2) / 4;
+     uint o = u_dst + 4u * i;
+     uvec4 b = astc_encode(~0u, false);
+     dst.w[o] = b.x;
+@@ -350,13 +360,15 @@
+         return 4;
+     case GL_COMPRESSED_RG_RGTC2:
+         return 5;
++    case GL_RGBA8:
++        return 6;
+     default:
+         return 3;
+     }
+ }
+ 
+ // A block's bytes as the game gives it, and as it's kept.
+-size_t in_bytes_of(unsigned kind) { return kind == 0 || kind == 1 || kind == 4 ? 8 : 16; }
++size_t in_bytes_of(unsigned kind) { return kind == 6 ? 64 : kind == 0 || kind == 1 || kind == 4 ? 8 : 16; }
+ size_t out_bytes_of(unsigned kind) { return kind == 4 ? 8 : 16; }
+ 
+ // A block of [format] that decodes to nothing: ASTC's void-extent transparent black (zeros would be its error colour),
+@@ -885,6 +897,8 @@
+         return eac != 0 ? GL_COMPRESSED_R11_EAC : 0;
+     case GL_COMPRESSED_RG_RGTC2:
+         return eac != 0 ? GL_COMPRESSED_RG11_EAC : 0;
++    case GL_RGBA8:   // the game's uncompressed icons (bc_shadow.cpp, mg_rgba_image)
++        return GL_COMPRESSED_RGBA_ASTC_4x4_KHR;
+     default:
+         return 0;
+     }
+@@ -1146,7 +1160,7 @@
+     // Kept at half the game's size (halve): x, y, width and height are what's stored, each block the average of the
+     // 2x2 the game gave under it. An upload's region starts on an even block: bc_shadow.cpp widens it to one.
+     GLsizei level_w = gwidth, level_h = gheight;
+-    const bool half = whole ? halve((GLuint)texture, level, gwidth, gheight)
++    const bool half = whole ? kind != 6 && halve((GLuint)texture, level, gwidth, gheight)
+                             : mg_half_size((GLuint)texture, level, &level_w, &level_h);
+     GLint x = gx, y = gy;
+     GLsizei width = gwidth, height = gheight;
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -27,6 +27,7 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <map>
++#include <set>
+ #include <mutex>
+ #include <utility>
+ #include <vector>
+@@ -107,6 +108,7 @@
+ }
+ 
+ size_t level_size(const Level& l) {
++    if (l.format == GL_RGBA8) return (size_t)l.width * l.height * 4;   // an RGBA level kept as ASTC (mg_rgba_image)
+     return (size_t)((l.width + 3) / 4) * ((l.height + 3) / 4) * block_bytes(l.format);
+ }
+ 
+@@ -700,12 +702,207 @@
+     GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
+     GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+     GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++}
++
++// Big RGBA textures kept as ASTC 4x4 (MG_RGBA_ASTC=0 leaves them RGBA). Factorio keeps its icons uncompressed ("not-
++// compressed"): an RGBA8 atlas 8192 wide and its mipmaps, made empty and filled from memory, a sprite at a time
++// anywhere, never drawn into. As ASTC it's a quarter of the memory: each upload goes into an RGBA copy on storage, and
++// the 4x4 blocks it touches are encoded again from the copy. A texture 4096 wide or more, made empty, is kept as ASTC
++// at its first upload: the game also makes a 4096x4096 RGBA texture it only draws into and reads back. One drawn into
++// after all goes back to RGBA from its copy.
++std::set<GLuint> rgba_textures;   // kept as ASTC
++std::map<std::pair<GLuint, GLint>, std::pair<GLsizei, GLsizei>> rgba_pending;   // made empty, not yet uploaded to
++const GLsizei RGBA_FROM = 4096;
++
++bool rgba_wanted() {
++    static const bool on = [] {
++        const char* v = getenv("MG_RGBA_ASTC");
++        const bool yes = !(v && !strcmp(v, "0"));
++        fprintf(stderr, "MobileGlues: big RGBA textures (the icons) %s\n", yes ? "kept as ASTC 4x4" : "left RGBA (MG_RGBA_ASTC=0)");
++        return yes;
++    }();
++    return on;
++}
++
++// [w]x[h] texels of an RGBA level's copy from x, y, row after row.
++bool read_texels(const Level& l, int x, int y, int w, int h, std::vector<uint8_t>& out) {
++    const size_t row = (size_t)w * 4;
++    out.resize(row * h);
++    for (int r = 0; r < h; r++) {
++        const size_t at = ((size_t)(y + r) * l.width + x) * 4;
++        if (at + row > l.size) return false;
++        if (l.offset < 0) {
++            memcpy(out.data() + r * row, l.memory.data() + at, row);
++            continue;
++        }
++        for (size_t done = 0; done < row;) {
++            ssize_t n = pread(store, out.data() + r * row + done, row - done, l.offset + (off_t)(at + done));
++            if (n <= 0) return false;
++            done += n;
++        }
++    }
++    return true;
+ }
+ 
++// [texture]'s levels kept as ASTC, back to RGBA from their copies: it's drawn into. Under [lock].
++void rgba_back(GLuint texture) {
++    for (auto it = rgba_pending.lower_bound({texture, -1}); it != rgba_pending.end() && it->first.first == texture;)
++        it = rgba_pending.erase(it);
++    if (!rgba_textures.erase(texture)) return;
++    mg_astc_flush_for(texture, -1);
++    GLint bound = 0, unpack = 0, row_length = 0, skip_rows = 0, skip_pixels = 0, alignment = 4;
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    GLES.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++    GLES.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++    GLES.glBindTexture(GL_TEXTURE_2D, texture);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++    GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    for (auto it = shadows.lower_bound({texture, -1}); it != shadows.end() && it->first.first == texture;) {
++        if (it->second.format != GL_RGBA8) { ++it; continue; }
++        std::vector<uint8_t> texels;
++        read_blocks(it->second, texels);
++        GLES.glTexImage2D(GL_TEXTURE_2D, it->first.second, GL_RGBA8, it->second.width, it->second.height, 0, GL_RGBA,
++                          GL_UNSIGNED_BYTE, texels.data());
++        it = shadows.erase(it);
++    }
++    fprintf(stderr, "MobileGlues: texture %u is drawn into: back to RGBA from its copy\n", texture);
++    GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++    GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++    GLES.glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++    GLES.glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++    GLES.glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++}
++
++// [texture]'s [level], the bound texture's, made again as an empty ASTC level with an RGBA copy. Under [lock].
++bool rgba_level(GLuint texture, GLint level, GLsizei width, GLsizei height) {
++    if (!mg_astc_upload(GL_TEXTURE_2D, level, 0, 0, width, height, GL_RGBA8, nullptr, 0, true)) return false;
++    Level l;
++    l.format = GL_RGBA8;
++    l.width = width;
++    l.height = height;
++    allocate(l);
++    shadows[{texture, level}] = std::move(l);
++    return true;
++}
++
+ } // namespace
+ 
+ extern "C" {
+ 
++// glTexImage2D of an empty RGBA8 level of a big texture (rgba_textures): made as ASTC here. False leaves it to the
++// driver.
++bool mg_rgba_image(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLenum format,
++                   GLenum type, const void* pixels) {
++    if (target != GL_TEXTURE_2D || pixels || (internalformat != GL_RGBA && internalformat != GL_RGBA8) ||
++        format != GL_RGBA || type != GL_UNSIGNED_BYTE || !rgba_wanted())
++        return false;
++    GLint unpack = 0;
++    GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    if (unpack) return false;   // pixels is an offset into it: not empty
++    const GLuint texture = bound_2d();
++    std::lock_guard<std::mutex> guard(lock);
++    rgba_pending.erase({texture, level});
++    if (level == 0 && width < RGBA_FROM) {
++        rgba_back(texture);
++        return false;
++    }
++    if (rgba_textures.count(texture)) return rgba_level(texture, level, width, height);
++    // Not kept as ASTC until it's uploaded to: made as the game asked, for now.
++    if (level == 0 || rgba_pending.count({texture, 0})) rgba_pending[{texture, level}] = {width, height};
++    return false;
++}
++
++// glTexSubImage2D into a level kept as ASTC: into its copy, and the blocks it touches encoded again, 64 rows at a
++// time. False leaves it to the driver.
++bool mg_rgba_sub_image(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
++                       GLenum type, const void* pixels) {
++    if (target != GL_TEXTURE_2D || width <= 0 || height <= 0) return false;
++    const GLuint texture = bound_2d();
++    std::lock_guard<std::mutex> guard(lock);
++    if (rgba_pending.count({texture, level}) && format == GL_RGBA && type == GL_UNSIGNED_BYTE) {
++        // Its first upload: every level made so far, kept as ASTC from now on.
++        bool all = true;
++        for (auto it = rgba_pending.lower_bound({texture, -1}); it != rgba_pending.end() && it->first.first == texture;) {
++            all = all && rgba_level(texture, it->first.second, it->second.first, it->second.second);
++            it = rgba_pending.erase(it);
++        }
++        if (all) rgba_textures.insert(texture);
++        else rgba_back(texture);
++    }
++    auto found = shadows.find({texture, level});
++    if (found == shadows.end() || found->second.format != GL_RGBA8) return false;
++    if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
++        // Not what the copy holds: the texture goes back to RGBA, and the driver takes it.
++        rgba_back(texture);
++        return false;
++    }
++    Level& l = found->second;
++    GLint row_length = 0, skip_rows = 0, skip_pixels = 0, alignment = 4;
++    GLES.glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++    GLES.glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++    GLES.glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++    if (alignment < 1) alignment = 1;
++    const size_t stride = ((size_t)(row_length > 0 ? row_length : width) * 4 + alignment - 1) / alignment * alignment;
++    const size_t first = (size_t)skip_rows * stride + (size_t)skip_pixels * 4;
++    const size_t span = first + (size_t)(height - 1) * stride + (size_t)width * 4;
++    const int w = std::min(width, l.width - x), h = std::min(height, l.height - y);
++    if (w <= 0 || h <= 0) return true;
++    const int level_bw = (l.width + 3) / 4, level_bh = (l.height + 3) / 4;
++    const int bx0 = x / 4, bx1 = std::min(level_bw, (x + w + 3) / 4);
++    const int by0 = y / 4, by1 = std::min(level_bh, (y + h + 3) / 4);
++    const int bw = bx1 - bx0, tx0 = bx0 * 4, tw = std::min(bw * 4, l.width - tx0);
++    // On whole blocks (Fast start's cache loads a level at once), they come from the upload itself; else the copy has
++    // the texels around it.
++    const bool whole = x % 4 == 0 && y % 4 == 0 && (w % 4 == 0 || x + w == l.width) && (h % 4 == 0 || y + h == l.height);
++    std::vector<uint8_t> rows, blocks;
++    source(pixels, span, [&](const uint8_t* bytes) {
++        for (int r = 0; r < h; r++)
++            write_blocks(l, ((size_t)(y + r) * l.width + x) * 4, bytes + first + (size_t)r * stride, (size_t)w * 4);
++        for (int band = by0; band < by1; band += 16) {
++            const int bh = std::min(16, by1 - band), ty0 = band * 4, th = std::min(bh * 4, l.height - ty0);
++            const uint8_t* from;
++            size_t from_stride;
++            if (whole) {
++                from = bytes + first + (size_t)(ty0 - y) * stride;
++                from_stride = stride;
++            } else {
++                if (!read_texels(l, tx0, ty0, tw, th, rows)) break;
++                from = rows.data();
++                from_stride = (size_t)tw * 4;
++            }
++            blocks.resize((size_t)bw * bh * 64);
++            for (int ty = 0; ty < bh * 4; ty++) {
++                const uint8_t* row = from + (size_t)std::min(ty, th - 1) * from_stride;   // past the edge: the last again
++                for (int bx = 0; bx < bw; bx++) {
++                    uint8_t* block = blocks.data() + (((size_t)(ty / 4) * bw + bx) * 16 + (ty % 4) * 4) * 4;
++                    const int sx = bx * 4;
++                    if (sx + 4 <= tw) memcpy(block, row + (size_t)sx * 4, 16);
++                    else
++                        for (int k = 0; k < 4; k++) memcpy(block + k * 4, row + (size_t)std::min(sx + k, tw - 1) * 4, 4);
++                }
++            }
++            mg_astc_upload(target, level, tx0, ty0, tw, th, GL_RGBA8, blocks.data(), blocks.size(), false);
++        }
++    });
++    return true;
++}
++
++// A texture about to be a framebuffer's attachment: one kept as ASTC goes back to RGBA first.
++void mg_rgba_attach(GLuint texture) {
++    if (!texture) return;
++    std::lock_guard<std::mutex> guard(lock);
++    rgba_back(texture);
++}
++
++
+ GLAPI GLAPIENTRY void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height,
+                             GLint border, GLsizei imageSize, const void* data) {
+     LOG()
+@@ -831,6 +1028,14 @@
+     if (pname != GL_TEXTURE_COMPRESSED_IMAGE_SIZE && pname != GL_TEXTURE_COMPRESSED &&
+         pname != GL_TEXTURE_INTERNAL_FORMAT) return false;
+     std::lock_guard<std::mutex> guard(lock);
++    {
++        // An RGBA level kept as ASTC is still the game's uncompressed RGBA8.
++        auto rgba = target == GL_TEXTURE_2D ? shadows.find({bound_2d(), level}) : shadows.end();
++        if (rgba != shadows.end() && rgba->second.format == GL_RGBA8) {
++            *params = pname == GL_TEXTURE_INTERNAL_FORMAT ? GL_RGBA8 : 0;
++            return true;
++        }
++    }
+     auto found = target == GL_TEXTURE_2D ? shadows.find({bound_2d(), level}) : shadows.end();
+     const bool compressed = found != shadows.end();
+     // A decoded texture is RGBA8 to the driver and still what the game made it.
+@@ -859,6 +1064,19 @@
+                 format, type);
+     }
+     if (target != GL_TEXTURE_2D || type != GL_UNSIGNED_BYTE) return false;
++    {
++        // An RGBA level kept as ASTC: its copy, as the game made it.
++        std::lock_guard<std::mutex> guard(lock);
++        auto found = shadows.find({bound_2d(), level});
++        if (found != shadows.end() && found->second.format == GL_RGBA8 && (format == GL_RGBA || format == GL_BGRA)) {
++            std::vector<uint8_t> texels;
++            if (!read_blocks(found->second, texels)) return false;
++            if (format == GL_BGRA)
++                for (size_t i = 0; i < texels.size(); i += 4) std::swap(texels[i], texels[i + 2]);
++            sink(pixels, texels.data(), texels.size());
++            return true;
++        }
++    }
+     Level copy;
+     std::vector<uint8_t> blocks;
+     {
+@@ -898,6 +1116,15 @@
+     for (GLsizei i = 0; i < n; i++) mg_astc_flush_for(textures[i], -1);
+     for (GLsizei i = 0; i < n; i++) mg_half_forget(textures[i], -1);
+     {
++        std::lock_guard<std::mutex> guard(lock);
++        for (GLsizei i = 0; i < n; i++) {
++            rgba_textures.erase(textures[i]);
++            for (auto it = rgba_pending.lower_bound({textures[i], -1});
++                 it != rgba_pending.end() && it->first.first == textures[i];)
++                it = rgba_pending.erase(it);
++        }
++    }
++    {
+         std::lock_guard<std::mutex> guard(made_lock);
+         for (GLsizei i = 0; i < n; i++)
+             for (auto it = made.lower_bound({textures[i], -1}); it != made.end() && it->first.first == textures[i];) {
+--- a/MobileGlues-cpp/gl/texture.cpp
++++ b/MobileGlues-cpp/gl/texture.cpp
+@@ -886,11 +886,14 @@
+ extern "C" void mg_bc_storage_format(GLenum*);
+ extern "C" void mg_bc_image_format(GLint*, GLenum*, GLenum*, const void*);
+ extern "C" bool mg_bc_compressed_image(GLenum, GLint, GLint, GLsizei, GLsizei, const void*);
++extern "C" bool mg_rgba_image(GLenum, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
++extern "C" bool mg_rgba_sub_image(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+ extern "C" void mg_tex_made(const char*, GLenum, GLint, GLint, GLenum, GLenum, GLsizei, GLsizei, GLenum);
+ void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border,
+                   GLenum format, GLenum type, const GLvoid* pixels) {
+     mg_bc_forget_level(target, level);
+     const GLint requested = internalFormat;
++    const GLenum requested_format = format, requested_type = type;
+     mg_bc_image_format(&internalFormat, &format, &type, pixels);
+     LOG()
+     LOG_D("mg_glTexImage2D,target: %s,level: %d,internalFormat: %s->%s,width: "
+@@ -958,7 +961,9 @@
+ 
+     // An empty BC level kept as ASTC is made there (bc_shadow.cpp). The driver's answer is logged when it fails or
+     // the level is big, and kept for the game, after any an earlier call left.
+-    if (!mg_bc_compressed_image(target, level, requested, width, height, pixels)) {
++    // So is an empty level of a big RGBA texture, the game's icons, kept as ASTC (bc_shadow.cpp, mg_rgba_image).
++    if (!mg_bc_compressed_image(target, level, requested, width, height, pixels) &&
++        !mg_rgba_image(target, level, requested, width, height, requested_format, requested_type, pixels)) {
+         const GLenum earlier = GLES.glGetError();
+         GLES.glTexImage2D(target, level, internalFormat, width, height, border, format, type, fix.pixels);
+         const GLenum error = GLES.glGetError();
+@@ -1483,6 +1488,8 @@
+ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height,
+                      GLenum format, GLenum type, const void* pixels) {
+     LOG()
++    // Into a level kept as ASTC (mg_rgba_image): its copy and blocks.
++    if (mg_rgba_sub_image(target, level, xoffset, yoffset, width, height, format, type, pixels)) return;
+ 
+     LOG_D("glTexSubImage2D, target = %s, level = %d, xoffset = %d, yoffset = %d, "
+           "width = %d, height = %d, format = %s, type = %s, pixels = 0x%x",
+--- a/MobileGlues-cpp/gl/framebuffer.cpp
++++ b/MobileGlues-cpp/gl/framebuffer.cpp
+@@ -293,11 +293,15 @@
+     }
+ }
+ 
++extern "C" void mg_rgba_attach(GLuint);
++// A texture kept as ASTC (the game's icons, bc_shadow.cpp) can't be drawn into: it goes back to RGBA first.
+ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
++    mg_rgba_attach(texture);
+     update_attachment(target, attachment, {attach_kind_t::Texture2D, textarget, texture, level, 0});
+     GLES.glFramebufferTexture2D(target, attachment, textarget, texture, level);
+ }
+ void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
++    mg_rgba_attach(texture);
+     // Kind rather than a made-up GL_TEXTURE_2D. This entry point attaches the
+     // whole texture, whatever its target is, and recording it as a 2D attachment
+     // meant a replay re-attached an array or 3D texture as if it were flat.

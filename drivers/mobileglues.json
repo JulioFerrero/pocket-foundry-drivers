@@ -51,7 +51,8 @@
       "patches/mobileglues-astc-buffer-uploads.patch",
       "patches/mobileglues-bc4-bc5-as-eac.patch",
       "patches/mobileglues-encoder-batches.patch",
-      "patches/mobileglues-half-atlases.patch"
+      "patches/mobileglues-half-atlases.patch",
+      "patches/mobileglues-rgba-as-astc.patch"
     ],
     "licences": [
       "LICENSE",
