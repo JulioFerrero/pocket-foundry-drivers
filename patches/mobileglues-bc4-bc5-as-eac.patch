@@ -1,0 +1,659 @@
+MobileGlues: BC4 and BC5 kept as EAC R11 and RG11, at their own size; empty levels filled without the encoder.
+
+Where OpenGL ES has no RGTC (Mali, PowerVR), the game's BC4 and BC5 textures were decoded to R8 and RG8: twice the
+memory of the blocks. A Xiaomi 12T (Mali-G610, 7.4 GB) loading High sprites made 8 BC4 atlases as 368 MB of R8 and 4
+BC5 ones as 155 MB of RG8, ran out of memory and the kernel restarted the phone. OpenGL ES 3.0 has EAC R11 and RG11 on
+every GPU, at BC4's and BC5's 4 and 8 bits a texel: each block is decoded and encoded again on the GPU, in the ASTC
+encoder's batches, by an EAC encoder written from Khronos' format spec. Tried on BC4 blocks against a decoder from the
+spec: 0.8 off (of 255) on gradients, 0.5 on shadow edges' full 0-255 ramps. The encoder's batches now count in words,
+as EAC R11 blocks are 8 bytes. When the encoder is built, a 64x8 level of each is encoded and drawn back; drawn wrong,
+BC4 and BC5 are decoded as before, and MG_BC_EAC=0 does that too, to compare.
+
+An empty level (Factorio makes every atlas empty, then fills it) was queued for the encoder to fill with transparent
+blocks, and waited in its output buffer with every other level made in a row, a second copy of them: with BC4 and BC5
+queued too, the 12T's Medium load went 700 MB higher for two seconds as the atlases were made. Now it's filled from
+memory with a constant block, 1 MB of rows at a time, and that peak is gone.
+
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -2,6 +2,8 @@
+ // BC (Mali, PowerVR). A compute shader decodes each BC block as bc_shadow.cpp's CPU decoder does and encodes it again
+ // with the ASTC encoder of taowen/libhybris' Vulkan compat layer (bc_astc_encoder.inc, MIT), which keeps BC1-BC3
+ // colour almost exactly: 8 bits a texel, where the RGBA8 that bc_shadow.cpp decodes into otherwise takes 32.
++// BC4 and BC5 are kept as EAC R11 and RG11, which OpenGL ES 3.0 has everywhere, at their own size: 4 and 8 bits a
++// texel, where the R8 and RG8 they were decoded into took twice that (eac_encode below, from Khronos' format spec).
+ #include "../includes.h"
+ #include <GL/gl.h>
+ #include "glcorearb.h"
+@@ -10,6 +12,8 @@
+ #include "mg.h"
+ #include "bc_astc.h"
+ #include "../egl/context.h"
++#include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -35,6 +39,14 @@
+ #define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
+ #define GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR 0x93D0
+ #endif
++#ifndef GL_COMPRESSED_RED_RGTC1
++#define GL_COMPRESSED_RED_RGTC1 0x8DBB
++#define GL_COMPRESSED_RG_RGTC2 0x8DBD
++#endif
++#ifndef GL_COMPRESSED_R11_EAC
++#define GL_COMPRESSED_R11_EAC 0x9270
++#define GL_COMPRESSED_RG11_EAC 0x9272
++#endif
+ 
+ extern "C" void mg_tex_made(const char*, GLenum, GLint, GLint, GLenum, GLenum, GLsizei, GLsizei, GLenum);
+ 
+@@ -42,20 +54,149 @@
+ 
+ #include "bc_astc_encoder.inc"
+ 
+-// One invocation a 4x4 block. u_kind: BC1 without alpha (0) or with (1), BC2 (2), BC3 (3), or none (4): an empty
+-// level, transparent black, where an ASTC block of zeros would be the decoder's error colour.
++// One invocation a 4x4 block. u_kind: BC1 without alpha (0) or with (1), BC2 (2) or BC3 (3) as ASTC 4x4, BC4 as EAC
++// R11 (4) or BC5 as EAC RG11 (5). Empty levels don't come here (empty_level).
+ const char kHeader[] = R"GLSL(#version 310 es
+ precision highp float;
+ precision highp int;
+ layout(local_size_x = 8, local_size_y = 8) in;
+ layout(std430, binding = 0) readonly buffer Src { uint w[]; } src;
+-layout(std430, binding = 1) writeonly buffer Dst { uvec4 b[]; } dst;
++layout(std430, binding = 1) writeonly buffer Dst { uint w[]; } dst;
+ layout(location = 0) uniform uvec2 u_blocks;
+ layout(location = 1) uniform uint u_kind;
+ layout(location = 2) uniform uint u_src;   /* the job's first word in src */
+-layout(location = 3) uniform uint u_dst;   /* and its first block in dst */
++layout(location = 3) uniform uint u_dst;   /* and its first word in dst */
+ const uint BC_QUALITY = 1u;
+ ivec4 g_px[16];
++vec4 g_eac[4];   /* one channel of a BC4 or BC5 block, a row each, in EAC R11's units */
++)GLSL";
++
++// EAC R11 (Khronos Data Format Specification, ETC2's "R11 EAC"): a block is a base codeword, a multiplier and one of
++// 16 modifier sets, and each texel one of its set's eight modifiers: 8 * base + 4 + modifier * 8 * multiplier, clamped
++// to 0..2047 (a multiplier of 0 counts as 1/8). Every set is tried at five multipliers around the one that spans the
++// block's values, with the base that centres it, and the closest of those again a base either side: as close as trying
++// every base around each (shadow edges, BC4's full 0-255 ramps, 0.5 off of 255; gradients 0.8), at a third of the
++// tries, each without branches (a slower search made Factorio's sprite loading take twice as long on a Mali-G610).
++const char kEac[] = R"GLSL(
++/* The sets' four magnitudes, a nibble each from the smallest: modifiers 0-3 are their negatives, 4-7 one less. */
++const uint EAC_SETS[16] = uint[16](0xF963u, 0xDA73u, 0xD852u, 0xD642u, 0xC863u, 0xB973u, 0xB874u, 0xB853u,
++                                   0xA862u, 0xA852u, 0xA842u, 0xA752u, 0xA743u, 0xA321u, 0x9864u, 0x9753u);
++
++vec4 eac_magnitudes(uint set)
++{
++    return vec4((uvec4(set) >> uvec4(0u, 4u, 8u, 12u)) & 15u);
++}
++
++/* What [base], [multiplier] and [set] decode to: modifiers 0-3 in [neg], 4-7 in [pos]. */
++void eac_values(int base, int multiplier, uint set, out vec4 neg, out vec4 pos)
++{
++    float centre = float(base * 8 + 4), step = multiplier == 0 ? 1.0 : float(multiplier * 8);
++    vec4 m = eac_magnitudes(set);
++    neg = clamp(vec4(centre) - m * step, 0.0, 2047.0);
++    pos = clamp(vec4(centre) + (m - 1.0) * step, 0.0, 2047.0);
++}
++
++float eac_nearest(float v, vec4 neg, vec4 pos)
++{
++    vec4 a = vec4(v) - neg, b = vec4(v) - pos;
++    vec4 d = min(a * a, b * b);
++    return min(min(d.x, d.y), min(d.z, d.w));
++}
++
++float eac_row(vec4 r, vec4 neg, vec4 pos)
++{
++    return eac_nearest(r.x, neg, pos) + eac_nearest(r.y, neg, pos) + eac_nearest(r.z, neg, pos) +
++           eac_nearest(r.w, neg, pos);
++}
++
++/* g_eac's squared error as [base], [multiplier] and [set] would give it. */
++float eac_error(int base, int multiplier, uint set)
++{
++    vec4 neg, pos;
++    eac_values(base, multiplier, set, neg, pos);
++    return eac_row(g_eac[0], neg, pos) + eac_row(g_eac[1], neg, pos) + eac_row(g_eac[2], neg, pos) +
++           eac_row(g_eac[3], neg, pos);
++}
++
++uint eac_bytes(uint v)   /* a block's word as it lies in memory: EAC is big-endian */
++{
++    return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);
++}
++
++/* g_eac as an EAC R11 block, its two words in memory order. */
++uvec2 eac_encode()
++{
++    vec4 lo4 = min(min(g_eac[0], g_eac[1]), min(g_eac[2], g_eac[3]));
++    vec4 hi4 = max(max(g_eac[0], g_eac[1]), max(g_eac[2], g_eac[3]));
++    float lo = min(min(lo4.x, lo4.y), min(lo4.z, lo4.w)), hi = max(max(hi4.x, hi4.y), max(hi4.z, hi4.w));
++    float best = 1e30;
++    int bb = 0, bm = 0;
++    uint bs = 0u;
++    for (uint s = 0u; s < 16u && best > 0.0; s++) {
++        vec4 m = eac_magnitudes(EAC_SETS[s]);
++        float low = -m.w, high = m.w - 1.0;   /* the set's most negative and most positive modifiers */
++        int spanning = int(round((hi - lo) / ((high - low) * 8.0)));
++        for (int k = max(spanning - 2, 0); k <= min(spanning + 2, 15); k++) {
++            float step = k == 0 ? 1.0 : float(k * 8);
++            int base = clamp(int(round((0.5 * (lo + hi) - 0.5 * (low + high) * step - 4.0) / 8.0)), 0, 255);
++            float error = eac_error(base, k, EAC_SETS[s]);
++            if (error < best) { best = error; bb = base; bm = k; bs = s; }
++        }
++    }
++    int centred = bb;
++    for (int b = max(centred - 1, 0); b <= min(centred + 1, 255) && best > 0.0; b += 2) {
++        float error = eac_error(b, bm, EAC_SETS[bs]);
++        if (error < best) { best = error; bb = b; }
++    }
++    /* Each texel's modifier, 3 bits at 45 - 3 * (x * 4 + y) of the 48 below the header. */
++    vec4 neg, pos;
++    eac_values(bb, bm, EAC_SETS[bs], neg, pos);
++    uint top = (uint(bb) << 24) | (uint(bm) << 20) | (bs << 16), low = 0u;
++    for (uint t = 0u; t < 16u; t++) {
++        float v = g_eac[t >> 2u][t & 3u];
++        vec4 a = vec4(v) - neg, b = vec4(v) - pos;
++        a *= a;
++        b *= b;
++        uint pick = 0u;
++        float nearest = a.x;
++        if (a.y < nearest) { nearest = a.y; pick = 1u; }
++        if (a.z < nearest) { nearest = a.z; pick = 2u; }
++        if (a.w < nearest) { nearest = a.w; pick = 3u; }
++        if (b.x < nearest) { nearest = b.x; pick = 4u; }
++        if (b.y < nearest) { nearest = b.y; pick = 5u; }
++        if (b.z < nearest) { nearest = b.z; pick = 6u; }
++        if (b.w < nearest) { pick = 7u; }
++        uint at = 45u - 3u * ((t & 3u) * 4u + (t >> 2u));   /* t is row-major, as BC4's texels */
++        if (at >= 32u) top |= pick << (at - 32u);
++        else {
++            low |= pick << at;
++            if (at > 29u) top |= pick >> (32u - at);
++        }
++    }
++    return uvec2(eac_bytes(top), eac_bytes(low));
++}
++
++/* A BC4 block's channel into g_eac: its eight values (or six, 0 and 255) unrounded, 0..255 as 0..2047. Indices are 3
++ * bits each from bit 16 of the 64-bit block. */
++void bc4_channel(uint w0, uint w1)
++{
++    float r0 = float(w0 & 0xffu), r1 = float((w0 >> 8) & 0xffu);
++    float p[8];
++    p[0] = r0;
++    p[1] = r1;
++    if (r0 > r1) {
++        for (int k = 1; k <= 6; k++) p[k + 1] = (float(7 - k) * r0 + float(k) * r1) / 7.0;
++    } else {
++        for (int k = 1; k <= 4; k++) p[k + 1] = (float(5 - k) * r0 + float(k) * r1) / 5.0;
++        p[6] = 0.0;
++        p[7] = 255.0;
++    }
++    for (uint t = 0u; t < 16u; t++) {
++        uint at = 16u + 3u * t;
++        uint v = at >= 32u ? w1 >> (at - 32u) : (w0 >> at) | (at > 29u ? w1 << (32u - at) : 0u);
++        g_eac[t >> 2u][t & 3u] = p[v & 7u] * (2047.0 / 255.0);
++    }
++}
+ )GLSL";
+ 
+ const char kDecoder[] = R"GLSL(
+@@ -115,10 +256,20 @@
+     uvec2 at = gl_GlobalInvocationID.xy;
+     if (at.x >= u_blocks.x || at.y >= u_blocks.y) return;
+     uint i = at.y * u_blocks.x + at.x;
+-    if (u_kind == 4u) {
+-        dst.b[u_dst + i] = uvec4(0xfffffdfcu, 0xffffffffu, 0u, 0u);
++    if (u_kind >= 4u) {
++        /* EAC: R11 two words a block, RG11 four, red then green */
++        bool two = u_kind == 5u;
++        uint s = u_src + (two ? 4u : 2u) * i, o = u_dst + (two ? 4u : 2u) * i;
++        for (uint c = 0u; c < (two ? 2u : 1u); c++) {
++            uint w0 = src.w[s + 2u * c], w1 = src.w[s + 2u * c + 1u];
++            bc4_channel(w0, w1);
++            uvec2 e = eac_encode();
++            dst.w[o + 2u * c] = e.x;
++            dst.w[o + 2u * c + 1u] = e.y;
++        }
+         return;
+     }
++    uint o = u_dst + 4u * i;
+     /* Copied out first: Mali's compiler refuses a read-only buffer's words as function arguments ("Function call
+      * discards 'readonly' access qualifier"). */
+     if (u_kind < 2u) {
+@@ -132,7 +283,11 @@
+         if (u_kind == 2u) alpha_bc2(a0, a1);
+         else alpha_bc3(a0, a1);
+     }
+-    dst.b[u_dst + i] = astc_encode(~0u, false);
++    uvec4 b = astc_encode(~0u, false);
++    dst.w[o] = b.x;
++    dst.w[o + 1u] = b.y;
++    dst.w[o + 2u] = b.z;
++    dst.w[o + 3u] = b.w;
+ }
+ )GLSL";
+ 
+@@ -147,12 +302,34 @@
+     case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:
+     case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
+         return 2;
++    case GL_COMPRESSED_RED_RGTC1:
++        return 4;
++    case GL_COMPRESSED_RG_RGTC2:
++        return 5;
+     default:
+         return 3;
+     }
+ }
+ 
+-// One upload: [src_word] and [dst_block] are where its blocks are in the encoder's buffers.
++// A block's bytes as the game gives it, and as it's kept.
++size_t in_bytes_of(unsigned kind) { return kind == 0 || kind == 1 || kind == 4 ? 8 : 16; }
++size_t out_bytes_of(unsigned kind) { return kind == 4 ? 8 : 16; }
++
++// A block of [format] that decodes to nothing: ASTC's void-extent transparent black (zeros would be its error colour),
++// EAC's zero (base 0, multiplier 1, every texel the first set's -15, clamped), twice for RG11.
++void empty_block(GLenum format, uint8_t* b) {
++    static const uint8_t eac[8] = {0x00, 0x10, 0x6d, 0xb6, 0xdb, 0x6d, 0xb6, 0xdb};
++    static const uint32_t astc[4] = {0xfffffdfcu, 0xffffffffu, 0u, 0u};
++    if (format == GL_COMPRESSED_R11_EAC || format == GL_COMPRESSED_RG11_EAC) {
++        memcpy(b, eac, 8);
++        if (format == GL_COMPRESSED_RG11_EAC) memcpy(b + 8, eac, 8);
++    } else {
++        memcpy(b, astc, 16);
++    }
++}
++
++// One upload: [src_word] and [dst_word] are where its blocks are in the encoder's buffers, [out] a block's bytes
++// there.
+ struct Job {
+     GLuint texture;
+     GLenum target, astc;
+@@ -160,8 +337,9 @@
+     GLsizei width, height;
+     unsigned kind;
+     GLuint bw, bh;
+-    size_t src_word, dst_block;
++    size_t src_word, dst_word;
+     bool whole;
++    size_t out;
+ };
+ 
+ struct Encoder {
+@@ -172,7 +350,7 @@
+     std::mutex queue_lock;
+     std::vector<uint8_t> staged;
+     std::vector<Job> jobs;
+-    size_t blocks = 0;
++    size_t words = 0;   // the jobs' encoded blocks, in 32-bit words
+ };
+ // A program and buffers belong to the contexts of one share group: made in the one MobileGlues starts in, they
+ // weren't the game's (its dispatches failed with GL_INVALID_OPERATION).
+@@ -206,7 +384,7 @@
+         fprintf(stderr, "MobileGlues BC: no ASTC or no compute shaders, so BC is decoded to RGBA8\n");
+         return false;
+     }
+-    const std::string source = std::string(kHeader) + kAstcEncoder + kDecoder;
++    const std::string source = std::string(kHeader) + kAstcEncoder + kEac + kDecoder;
+     const char* text = source.c_str();
+     // Each step said before the driver takes it: a Pixel 10's PowerVR on Android 16 crashed in one, and nothing said
+     // which.
+@@ -423,6 +601,12 @@
+     while (GLES.glGetError() != GL_NO_ERROR) {}
+     return right;
+ }
++// Whether BC4 and BC5 are kept as EAC: -1 not checked yet, 0 not (MG_BC_EAC=0, or the check drew them wrong, so
++// they're decoded as before), 1 they are.
++std::atomic<int> eac{-1};
++
++bool eac_drawn_right(Encoder& encoder, std::string& detail);
++
+ } // namespace
+ 
+ GLenum mg_astc_for(GLenum bc) {
+@@ -437,6 +621,10 @@
+     case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
+     case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
+         return GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR;
++    case GL_COMPRESSED_RED_RGTC1:
++        return eac != 0 ? GL_COMPRESSED_R11_EAC : 0;
++    case GL_COMPRESSED_RG_RGTC2:
++        return eac != 0 ? GL_COMPRESSED_RG11_EAC : 0;
+     default:
+         return 0;
+     }
+@@ -454,6 +642,19 @@
+             else
+                 fprintf(stderr, "MobileGlues BC: compressed uploads from a buffer land wrong in a 8192x512 level (%s), "
+                         "so the encoded blocks are uploaded from memory\n", detail.c_str());
++        }
++        if (encoder.ready && eac < 0) {
++            const char* off = getenv("MG_BC_EAC");
++            std::string detail;
++            if (off && !strcmp(off, "0")) {
++                eac = 0;
++                fprintf(stderr, "MobileGlues BC: BC4 and BC5 decoded to R8 and RG8 (MG_BC_EAC=0)\n");
++            } else {
++                eac = eac_drawn_right(encoder, detail);
++                fprintf(stderr, "MobileGlues BC: BC4 and BC5 %s (%s)\n",
++                        eac ? "kept as EAC R11 and RG11, encoded on the GPU" : "drawn wrong as EAC, so decoded to R8 and RG8",
++                        detail.c_str());
++            }
+         }
+     }
+     return encoder.ready;
+@@ -462,8 +663,9 @@
+ namespace {
+ 
+ // [jobs]' blocks, [staged], to the GPU, a dispatch each, then each into its texture: one wait for the GPU for all.
++// [words]: what they encode into.
+ void run(const Encoder& encoder, const std::vector<Job>& jobs, const uint8_t* staged, size_t staged_bytes,
+-         size_t blocks) {
++         size_t words) {
+     // The game's state, put back after.
+     GLint program = 0, unpack = 0, storage = 0, texture = 0, bound[2] = {};
+     GLint64 start[2] = {}, length[2] = {};
+@@ -485,7 +687,7 @@
+     GLES.glBufferData(GL_SHADER_STORAGE_BUFFER, empty ? 16 : (GLsizeiptr)staged_bytes, empty ? nullptr : staged,
+                       GL_STREAM_DRAW);
+     GLES.glBindBuffer(GL_SHADER_STORAGE_BUFFER, encoder.out);
+-    GLES.glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(blocks * 16), nullptr, GL_STREAM_COPY);
++    GLES.glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)(words * 4), nullptr, GL_STREAM_COPY);
+     GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, encoder.in);
+     GLES.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, encoder.out);
+     GLES.glUseProgram(encoder.program);
+@@ -493,7 +695,7 @@
+         GLES.glUniform2ui(0, job.bw, job.bh);
+         GLES.glUniform1ui(1, job.kind);
+         GLES.glUniform1ui(2, (GLuint)job.src_word);
+-        GLES.glUniform1ui(3, (GLuint)job.dst_block);
++        GLES.glUniform1ui(3, (GLuint)job.dst_word);
+         GLES.glDispatchCompute((job.bw + 7) / 8, (job.bh + 7) / 8, 1);
+     }
+     GLES.glMemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
+@@ -502,10 +704,10 @@
+     std::vector<uint8_t> read_back;
+     if (buffer_uploads == 0) {
+         GLES.glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+-        const void* mapped = GLES.glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(blocks * 16),
++        const void* mapped = GLES.glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(words * 4),
+                                                    GL_MAP_READ_BIT);
+         if (mapped) {
+-            read_back.assign((const uint8_t*)mapped, (const uint8_t*)mapped + blocks * 16);
++            read_back.assign((const uint8_t*)mapped, (const uint8_t*)mapped + words * 4);
+             GLES.glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+         } else {
+             static int unread = 0;
+@@ -528,53 +730,141 @@
+     size_t failed = 0;
+     for (const Job& job : jobs) {
+         if (job.texture != bound_texture) GLES.glBindTexture(GL_TEXTURE_2D, bound_texture = job.texture);
+-        const GLsizei size = (GLsizei)job.bw * (GLsizei)job.bh * 16;
++        const GLsizei size = (GLsizei)job.bw * (GLsizei)job.bh * (GLsizei)job.out;
+         const void* offset =
+-            read_back.empty() ? (const void*)(job.dst_block * 16) : read_back.data() + job.dst_block * 16;
++            read_back.empty() ? (const void*)(job.dst_word * 4) : read_back.data() + job.dst_word * 4;
+         if (job.whole)
+             GLES.glCompressedTexImage2D(job.target, job.level, job.astc, job.width, job.height, 0, size, offset);
+         else
+             GLES.glCompressedTexSubImage2D(job.target, job.level, job.x, job.y, job.width, job.height, job.astc, size,
+                                            offset);
+         const GLenum error = GLES.glGetError();
+-        if (job.whole) mg_tex_made("an ASTC level with its blocks", job.target, job.level, 1, job.astc, job.astc,
++        if (job.whole) mg_tex_made("a converted level with its blocks", job.target, job.level, 1, job.astc, job.astc,
+                                    job.width, job.height, error);
+         if (error != GL_NO_ERROR && failed++ < 3)
+-            fprintf(stderr, "MobileGlues BC: ASTC upload %dx%d at %d,%d level %d of texture %u: GL error 0x%x\n",
+-                    job.width, job.height, job.x, job.y, job.level, job.texture, error);
++            fprintf(stderr, "MobileGlues BC: upload as 0x%x, %dx%d at %d,%d level %d of texture %u: GL error 0x%x\n",
++                    job.astc, job.width, job.height, job.x, job.y, job.level, job.texture, error);
+         if (error == GL_NO_ERROR) encoded += size;
+     }
+     if (bound_texture != (GLuint)texture) GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)texture);
+     GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+     if (encoded - reported >= (64u << 20)) {
+         reported = encoded;
+-        fprintf(stderr, "MobileGlues BC: %zu MB of ASTC so far\n", encoded >> 20);
++        fprintf(stderr, "MobileGlues BC: %zu MB of ASTC and EAC so far\n", encoded >> 20);
+     }
+ }
+ 
+ void flush(Encoder& encoder) {
+     if (encoder.jobs.empty()) return;
+-    run(encoder, encoder.jobs, encoder.staged.data(), encoder.staged.size(), encoder.blocks);
++    run(encoder, encoder.jobs, encoder.staged.data(), encoder.staged.size(), encoder.words);
+     queued -= (int)encoder.jobs.size();
+     encoder.jobs.clear();
+     encoder.staged.clear();
+-    encoder.blocks = 0;
++    encoder.words = 0;
+ }
+ 
++// A BC4 block's 16 values, row-major, unrounded on 0..255: as the GPU encoder decodes it (bc4_channel).
++void bc4_values(const uint8_t* b, float out[16]) {
++    const float r0 = b[0], r1 = b[1];
++    float p[8] = {r0, r1};
++    if (r0 > r1) {
++        for (int k = 1; k <= 6; k++) p[k + 1] = ((7 - k) * r0 + k * r1) / 7;
++    } else {
++        for (int k = 1; k <= 4; k++) p[k + 1] = ((5 - k) * r0 + k * r1) / 5;
++        p[6] = 0;
++        p[7] = 255;
++    }
++    uint64_t bits = 0;
++    for (int k = 0; k < 6; k++) bits |= (uint64_t)b[2 + k] << (8 * k);
++    for (int t = 0; t < 16; t++) out[t] = p[(bits >> (3 * t)) & 7];
++}
++
++// Whether BC4 and BC5 encoded as EAC draw as they decode: a 64x8 level of each, of blocks with all-zero, all-255,
++// both of BC4's ramps and random endpoints and indices, encoded as the game's would be and drawn back. [detail]: how
++// far off they came, on 0..255. EAC can't take every BC4 block exactly (its steps aren't even), so a few off is right;
++// blocks in the wrong place or the wrong byte order are far off.
++bool eac_drawn_right(Encoder& encoder, std::string& detail) {
++    const int W = 64, H = 8, bw = W / 4, bh = H / 4, n = bw * bh;
++    uint32_t seed = 0x9e3779b9u;
++    auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return (uint8_t)(seed >> 24); };
++    std::vector<uint8_t> bc4((size_t)n * 8), bc5((size_t)n * 16);
++    for (uint8_t& byte : bc4) byte = next();
++    for (uint8_t& byte : bc5) byte = next();
++    const uint8_t fixed[4][2] = {{0, 0}, {255, 255}, {0, 255}, {255, 0}};
++    for (int i = 0; i < 4; i++) {
++        bc4[i * 8] = fixed[i][0];
++        bc4[i * 8 + 1] = fixed[i][1];
++    }
++    for (int k = 2; k < 8; k++) bc4[k] = 0;   // the all-zero block: index 0 everywhere
++    double worst = 0, sum = 0;
++    size_t count = 0;
++    std::string why;
++    GLint bound = 0;
++    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++    for (int two = 0; two < 2 && why.empty(); two++) {
++        const GLenum format = two ? GL_COMPRESSED_RG11_EAC : GL_COMPRESSED_R11_EAC;
++        const size_t out = two ? 16 : 8;
++        const std::vector<uint8_t>& blocks = two ? bc5 : bc4;
++        GLuint texture = 0;
++        GLES.glGenTextures(1, &texture);
++        GLES.glBindTexture(GL_TEXTURE_2D, texture);
++        while (GLES.glGetError() != GL_NO_ERROR) {}
++        std::vector<uint8_t> zeros((size_t)n * out);
++        GLES.glCompressedTexImage2D(GL_TEXTURE_2D, 0, format, W, H, 0, (GLsizei)zeros.size(), zeros.data());
++        if (GLES.glGetError() != GL_NO_ERROR) why = "the level wasn't made";
++        std::vector<uint8_t> rgba;
++        if (why.empty()) {
++            const Job job{texture, GL_TEXTURE_2D, format, 0, 0, 0, W, H, two ? 5u : 4u, (GLuint)bw, (GLuint)bh, 0, 0,
++                          false, out};
++            const size_t before = encoded;
++            run(encoder, {job}, blocks.data(), blocks.size(), (size_t)n * out / 4);
++            if (encoded == before) why = "the upload failed";
++            else draw_back(texture, 0, 0, W, H, rgba, why);
++        }
++        for (int b = 0; b < n && why.empty(); b++) {
++            for (int c = 0; c <= two; c++) {
++                float want[16];
++                bc4_values(blocks.data() + (size_t)b * (two ? 16 : 8) + c * 8, want);
++                for (int t = 0; t < 16; t++) {
++                    const int x = (b % bw) * 4 + t % 4, y = (b / bw) * 4 + t / 4;
++                    const double off = fabs(rgba[((size_t)y * W + x) * 4 + c] - want[t]);
++                    worst = std::max(worst, off);
++                    sum += off;
++                    count++;
++                }
++            }
++        }
++        GLES.glDeleteTextures(1, &texture);
++    }
++    GLES.glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++    while (GLES.glGetError() != GL_NO_ERROR) {}
++    if (!why.empty()) {
++        detail = why;
++        return false;
++    }
++    const double mean = count ? sum / count : 0;
++    char text[96];
++    snprintf(text, sizeof text, "drawn back %.1f off on average, %.0f at most, of 255", mean, worst);
++    detail = text;
++    return mean <= 4 && worst <= 40;
++}
++
+ } // namespace
+ 
+ bool mg_astc_upload(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum bc,
+                     const uint8_t* blocks, size_t size, bool whole) {
+-    const GLenum astc = mg_astc_for(bc);
+-    const unsigned kind = blocks ? kind_of(bc) : 4;
++    const unsigned kind = kind_of(bc);
+     const GLuint bw = (GLuint)(width + 3) / 4, bh = (GLuint)(height + 3) / 4;
+-    const size_t in_bytes = blocks ? (size_t)bw * bh * (kind < 2 ? 8 : 16) : 0;
+-    if (!astc || !mg_astc_ready() || (blocks && size < in_bytes)) return false;
++    const size_t in_bytes = blocks ? (size_t)bw * bh * in_bytes_of(kind) : 0, out = out_bytes_of(kind);
++    // Ready first: building the encoder checks EAC, which may leave BC4 and BC5 decoded.
++    if (!mg_astc_for(bc) || !mg_astc_ready() || (blocks && size < in_bytes)) return false;
++    const GLenum astc = mg_astc_for(bc);
++    if (!astc) return false;
+     Encoder& encoder = current();
+     GLint texture = 0;
+     GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+     std::lock_guard<std::mutex> guard(encoder.queue_lock);
+-    Job job{(GLuint)texture, target, astc, level, x, y, width, height, kind, bw, bh, 0, 0, whole};
++    Job job{(GLuint)texture, target, astc, level, x, y, width, height, kind, bw, bh, 0, 0, whole, out};
+     if (whole) {
+         // A level made, or remade. What's waiting for it goes first. The level is made now, its blocks come with the
+         // batch: Factorio makes some 3,000 while loading, and each made at once waited for the GPU. Where the driver
+@@ -589,25 +879,54 @@
+         GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+         if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         while (GLES.glGetError() != GL_NO_ERROR) {}
+-        GLES.glCompressedTexImage2D(target, level, astc, width, height, 0, (GLsizei)((size_t)bw * bh * 16), nullptr);
++        GLES.glCompressedTexImage2D(target, level, astc, width, height, 0, (GLsizei)((size_t)bw * bh * out), nullptr);
+         const GLenum empty = GLES.glGetError();
+         const bool made = empty == GL_NO_ERROR;
+         // Not made empty is no failure yet: it's made next with its blocks, and logged there.
+-        if (made) mg_tex_made("an empty ASTC level", target, level, 1, bc, astc, width, height, GL_NO_ERROR);
+-        else fprintf(stderr, "MobileGlues BC: texture %u level %d, %dx%d: the driver won't make an empty ASTC level "
+-                     "(GL error 0x%x): made with its blocks\n", (GLuint)texture, level, width, height, empty);
++        if (made) mg_tex_made(astc == GL_COMPRESSED_R11_EAC || astc == GL_COMPRESSED_RG11_EAC ? "an empty EAC level" :
++                              "an empty ASTC level", target, level, 1, bc, astc, width, height, GL_NO_ERROR);
++        else fprintf(stderr, "MobileGlues BC: texture %u level %d, %dx%d: the driver won't make an empty level of 0x%x "
++                     "(GL error 0x%x): made with its blocks\n", (GLuint)texture, level, width, height, astc, empty);
++        if (!blocks) {
++            // Empty: blocks that decode to nothing (empty_block), from memory, a strip of rows at a time. Queued for
++            // the encoder as the game's blocks are, they waited in its output buffer with every other level Factorio
++            // makes in a row, a second copy of them all: on a Xiaomi 12T loading High sprites, 1.9 GB, and the phone
++            // ran out of memory. A driver that won't make the level empty gets all its rows at once.
++            const size_t row = (size_t)bw * out;
++            const GLuint rows = made ? (GLuint)std::max<size_t>(1, std::min<size_t>(bh, (1u << 20) / row)) : bh;
++            std::vector<uint8_t> strip(row * rows);
++            for (size_t at = 0; at < strip.size(); at += out) empty_block(astc, strip.data() + at);
++            GLenum error = GL_NO_ERROR;
++            if (!made) {
++                GLES.glCompressedTexImage2D(target, level, astc, width, height, 0, (GLsizei)strip.size(), strip.data());
++                error = GLES.glGetError();
++                mg_tex_made("an empty level with its blocks", target, level, 1, bc, astc, width, height, error);
++            }
++            for (GLuint y = 0; made && y < bh && error == GL_NO_ERROR; y += rows) {
++                const GLuint n = std::min(rows, bh - y);
++                const GLsizei h = std::min((GLsizei)(n * 4), height - (GLsizei)(y * 4));
++                GLES.glCompressedTexSubImage2D(target, level, 0, (GLint)(y * 4), width, h, astc, (GLsizei)(row * n),
++                                               strip.data());
++                error = GLES.glGetError();
++            }
++            if (made && error != GL_NO_ERROR)
++                fprintf(stderr, "MobileGlues BC: texture %u level %d, %dx%d of 0x%x: emptying it gave GL error 0x%x\n",
++                        (GLuint)texture, level, width, height, astc, error);
++            if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++            return error == GL_NO_ERROR;
++        }
+         if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+         if (!made) {
+             const size_t before = encoded;
+-            run(encoder, {job}, blocks, in_bytes, (size_t)bw * bh);
++            run(encoder, {job}, blocks, in_bytes, (size_t)bw * bh * out / 4);
+             return encoded > before;
+         }
+         job.whole = false;
+     }
+     job.src_word = encoder.staged.size() / 4;
+-    job.dst_block = encoder.blocks;
++    job.dst_word = encoder.words;
+     encoder.staged.insert(encoder.staged.end(), blocks, blocks + in_bytes);
+-    encoder.blocks += (size_t)bw * bh;
++    encoder.words += (size_t)bw * bh * out / 4;
+     encoder.jobs.push_back(job);
+     queued++;
+     if (encoder.staged.size() >= (16u << 20) || encoder.jobs.size() >= 4096) flush(encoder);
+--- a/MobileGlues-cpp/gl/bc_astc.h
++++ b/MobileGlues-cpp/gl/bc_astc.h
+@@ -1,4 +1,4 @@
+-// Pocket Foundry patch for MobileGlues (LGPL-2.1): BC1-BC3 kept as ASTC 4x4 (bc_astc.cpp).
++// Pocket Foundry patch for MobileGlues (LGPL-2.1): BC1-BC3 kept as ASTC 4x4, BC4 and BC5 as EAC (bc_astc.cpp).
+ #ifndef MOBILEGLUES_BC_ASTC_H
+ #define MOBILEGLUES_BC_ASTC_H
+ 
+@@ -6,7 +6,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
+-// The ASTC 4x4 format BC1, BC2 or BC3 [bc] is kept as, else 0.
++// What [bc] is kept as: ASTC 4x4 for BC1-BC3, EAC R11 or RG11 for BC4 and BC5; else 0, decoded.
+ GLenum mg_astc_for(GLenum bc);
+ 
+ // Whether this thread's context can: OpenGL ES 3.1's compute shaders, ASTC, and the encoder built.
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -4,8 +4,8 @@
+ // compressor that way at every start. This keeps a CPU copy of every BC upload to 2D textures and answers from it:
+ // the bytes as they were uploaded, and RGBA8 decoded on the CPU (BC1-BC5). The copies live in a deleted file in
+ // MG_DIR_PATH, not in memory: a game's whole set of atlases is gigabytes, read back once if at all.
+-// Where OpenGL ES has no BC (Mali, PowerVR), BC1-BC3 textures are ASTC 4x4, encoded on the GPU (bc_astc.cpp), and
+-// the others, or all of them without ASTC, are uncompressed with every BC upload decoded into them: Factorio makes its
++// Where OpenGL ES has no BC (Mali, PowerVR), BC1-BC3 textures are ASTC 4x4 and BC4 and BC5 EAC, encoded on the GPU
++// (bc_astc.cpp), and the others, or all of them without it, are uncompressed with every BC upload decoded into them: Factorio makes its
+ // mipmapped atlas BC whatever its settings say. MG_BC_DECODE=1 decodes on every GPU, and MG_BC_DECODE=astc takes the
+ // ASTC way on every GPU, to test them.
+ #include "../includes.h"
+@@ -246,8 +246,8 @@
+     if (native(format)) return 0;
+     const char* force = getenv("MG_BC_DECODE");
+     if (force && !strcmp(force, "1")) return 0;
+-    const GLenum astc = mg_astc_for(format);
+-    return astc && mg_astc_ready() ? astc : 0;
++    // Asked again once ready: building the encoder checks EAC, which may leave BC4 and BC5 decoded.
++    return mg_astc_for(format) && mg_astc_ready() ? mg_astc_for(format) : 0;
+ }
+ 
+ // What a decoded [format] is stored as: one channel for BC4, two for BC5, three for BC1 without alpha, RGBA8 else.
+@@ -324,6 +324,8 @@
+     if (const int bb = block_bytes(format)) return (w + 3) / 4 * ((h + 3) / 4) * bb;
+     switch (format) {
+     case 0x93B0: case 0x93D0: return (w + 3) / 4 * ((h + 3) / 4) * 16;   // ASTC 4x4
++    case 0x9270: return (w + 3) / 4 * ((h + 3) / 4) * 8;                  // EAC R11
++    case 0x9272: return (w + 3) / 4 * ((h + 3) / 4) * 16;                 // EAC RG11
+     case GL_R8: case GL_RED: return w * h;
+     case GL_RG8: case GL_RG: return w * h * 2;
+     case GL_RGB8: case GL_SRGB8: case GL_RGB: return w * h * 3;

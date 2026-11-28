@@ -42,7 +42,8 @@
       "patches/mobileglues-native-bc-empty-levels.patch",
       "patches/mobileglues-bc-drawn-check.patch",
       "patches/mobileglues-astc-encoder-by-name.patch",
-      "patches/mobileglues-astc-buffer-uploads.patch"
+      "patches/mobileglues-astc-buffer-uploads.patch",
+      "patches/mobileglues-bc4-bc5-as-eac.patch"
     ],
     "licences": [
       "LICENSE",
