@@ -1,0 +1,627 @@
+MobileGlues: MG_BC_HALF=1 keeps the game's atlases at half their width and height, a quarter of the memory.
+
+Prototype. Where BC is converted (Mali, PowerVR), a texture whose level 0 is 1024 wide or more is kept at half the
+game's size, each block the average of the 2x2 the game gave under it (the sprites are premultiplied, so a plain
+average). The game draws its sprites by where they are in their atlas as a fraction of it, so they're where it looks,
+softer. An upload grows to whole pairs of blocks, its neighbours read from the copy every upload already has, and the
+game is told its own sizes; read back, a level is the game's, at its size.
+The shader decodes and encodes from one place each: the driver's compiler copies a function wherever it's called, and
+the game waits for it as it starts (a second ASTC encoder took a Mali-G610 1.2 s and 300 MB more).
+Shaders that ask a 2D texture's size (textureSize) or fetch its texels by position (texelFetch) were written for the
+game's size: Factorio's trees turn a pixel position from textureSize back into a place in the atlas with the size it
+knows, and with a halved atlas their leaves came from other sprites. Each such sampler gets a shift uniform, 1 while
+the texture bound to it is kept at half, set before each draw: the size shifted up, a texel's position down.
+--- a/MobileGlues-cpp/gl/bc_astc.cpp
++++ b/MobileGlues-cpp/gl/bc_astc.cpp
+@@ -12,12 +12,15 @@
+ #include "mg.h"
+ #include "bc_astc.h"
+ #include "../egl/context.h"
++#include "texture.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <atomic>
++#include <regex>
++#include <set>
+ #include <chrono>
+ #include <map>
+ #include <mutex>
+@@ -56,7 +59,9 @@
+ #include "bc_astc_encoder.inc"
+ 
+ // One invocation a 4x4 block. u_kind: BC1 without alpha (0) or with (1), BC2 (2) or BC3 (3) as ASTC 4x4, BC4 as EAC
+-// R11 (4) or BC5 as EAC RG11 (5). Empty levels don't come here (empty_level).
++// R11 (4) or BC5 as EAC RG11 (5). Empty levels don't come here (empty_level). u_region: for a level kept at half the
++// game's size (MG_BC_HALF), the game blocks the job's region has, across and down: each block made is the average of
++// the 2x2 of them under it (the sprites are premultiplied, so a plain average); else 0.
+ const char kHeader[] = R"GLSL(#version 310 es
+ precision highp float;
+ precision highp int;
+@@ -67,6 +72,7 @@
+ layout(location = 1) uniform uint u_kind;
+ layout(location = 2) uniform uint u_src;   /* the job's first word in src */
+ layout(location = 3) uniform uint u_dst;   /* and its first word in dst */
++layout(location = 4) uniform uvec2 u_region;
+ const uint BC_QUALITY = 1u;
+ ivec4 g_px[16];
+ vec4 g_eac[4];   /* one channel of a BC4 or BC5 block, a row each, in EAC R11's units */
+@@ -249,6 +255,28 @@
+         uint at = 16u + 3u * t;
+         uint v = at >= 32u ? w1 >> (at - 32u) : (w0 >> at) | (at > 29u ? w1 << (32u - at) : 0u);
+         g_px[t].a = p[v & 7u];
++    }
++}
++
++/* Where the game's block [g] of a halved job's region starts in src: past an odd edge, the last one again. */
++uint src_block(uvec2 g, uint words)
++{
++    g = min(g, u_region - 1u);
++    return u_src + (g.y * u_region.x + g.x) * words;
++}
++
++/* The BC1-BC3 block at word [s] into g_px. Copied out first: Mali's compiler refuses a read-only buffer's words as
++ * function arguments ("Function call discards 'readonly' access qualifier"). */
++void decode_bc(uint s)
++{
++    if (u_kind < 2u) {
++        uint c01 = src.w[s], indices = src.w[s + 1u];
++        colour(c01, indices, false, u_kind == 0u);
++    } else {
++        uint a0 = src.w[s], a1 = src.w[s + 1u], c01 = src.w[s + 2u], indices = src.w[s + 3u];
++        colour(c01, indices, true, true);
++        if (u_kind == 2u) alpha_bc2(a0, a1);
++        else alpha_bc3(a0, a1);
+     }
+ }
+ 
+@@ -257,33 +285,48 @@
+     uvec2 at = gl_GlobalInvocationID.xy;
+     if (at.x >= u_blocks.x || at.y >= u_blocks.y) return;
+     uint i = at.y * u_blocks.x + at.x;
+-    if (u_kind >= 4u) {
++    bool halved = u_region.x != 0u;
++    if (u_kind == 4u || u_kind == 5u) {
+         /* EAC: R11 two words a block, RG11 four, red then green */
+         bool two = u_kind == 5u;
+-        uint s = u_src + (two ? 4u : 2u) * i, o = u_dst + (two ? 4u : 2u) * i;
++        uint words = two ? 4u : 2u, o = u_dst + words * i;
+         for (uint c = 0u; c < (two ? 2u : 1u); c++) {
+-            uint w0 = src.w[s + 2u * c], w1 = src.w[s + 2u * c + 1u];
+-            bc4_channel(w0, w1);
++            vec4 sum[4] = vec4[4](vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0));
++            for (uint q = 0u; q < (halved ? 4u : 1u); q++) {   /* one call to the decoder, as below */
++                uvec2 d = uvec2(q & 1u, q >> 1u);
++                uint s = (halved ? src_block(2u * at + d, words) : u_src + words * i) + 2u * c;
++                uint w0 = src.w[s], w1 = src.w[s + 1u];
++                bc4_channel(w0, w1);
++                for (uint r = 0u; r < 4u && halved; r++) {
++                    vec4 row = g_eac[r];
++                    vec2 pair = vec2(row.x + row.y, row.z + row.w);
++                    uint into = 2u * d.y + (r >> 1u);
++                    if (d.x == 0u) sum[into].xy += pair;
++                    else sum[into].zw += pair;
++                }
++            }
++            for (uint r = 0u; r < 4u && halved; r++) g_eac[r] = sum[r] * 0.25;
+             uvec2 e = eac_encode();
+             dst.w[o + 2u * c] = e.x;
+             dst.w[o + 2u * c + 1u] = e.y;
+         }
+         return;
+     }
++    /* ASTC: one call each to the decoder and the encoder, which the driver's compiler copies wherever they're called
++     * (a second ASTC encoder took a Mali-G610 1.2 s and 300 MB more to compile, as the game started) */
++    uint words = u_kind < 2u ? 2u : 4u;
++    ivec4 sum[16];
++    for (uint t = 0u; t < 16u; t++) sum[t] = ivec4(0);
++    for (uint q = 0u; q < (halved ? 4u : 1u); q++) {
++        uvec2 d = uvec2(q & 1u, q >> 1u);
++        decode_bc(halved ? src_block(2u * at + d, words) : u_src + words * i);
++        for (uint t = 0u; t < 16u && halved; t++) {
++            uint k = (2u * d.y + ((t >> 2u) >> 1u)) * 4u + 2u * d.x + ((t & 3u) >> 1u);
++            sum[k] += g_px[t];
++        }
++    }
++    for (uint t = 0u; t < 16u && halved; t++) g_px[t] = (sum[t] + 2) / 4;
+     uint o = u_dst + 4u * i;
+-    /* Copied out first: Mali's compiler refuses a read-only buffer's words as function arguments ("Function call
+-     * discards 'readonly' access qualifier"). */
+-    if (u_kind < 2u) {
+-        uint s = u_src + 2u * i;
+-        uint c01 = src.w[s], indices = src.w[s + 1u];
+-        colour(c01, indices, false, u_kind == 0u);
+-    } else {
+-        uint s = u_src + 4u * i;
+-        uint a0 = src.w[s], a1 = src.w[s + 1u], c01 = src.w[s + 2u], indices = src.w[s + 3u];
+-        colour(c01, indices, true, true);
+-        if (u_kind == 2u) alpha_bc2(a0, a1);
+-        else alpha_bc3(a0, a1);
+-    }
+     uvec4 b = astc_encode(~0u, false);
+     dst.w[o] = b.x;
+     dst.w[o + 1u] = b.y;
+@@ -341,6 +384,7 @@
+     size_t src_word, dst_word;
+     bool whole;
+     size_t out;
++    GLuint rbw = 0, rbh = 0;   // halved: the game blocks of its region (u_region)
+ };
+ 
+ // A batch's most: the game's blocks staged for it, and what they encode into, each. The GPU's buffers for them are
+@@ -629,8 +673,202 @@
+ 
+ bool eac_drawn_right(Encoder& encoder, std::string& detail);
+ 
++// Levels kept at half the game's width and height (MG_BC_HALF=1), a quarter of the memory: (texture, level) -> the
++// game's size of it. The game's sprites are drawn by where they are in their atlas as a fraction of it, so a smaller
++// atlas still has them where the game looks, a little softer. Atlases only: the game's sprite sheets are 2048 to 8192
++// wide, and smaller textures stay as they are.
++std::map<std::pair<GLuint, GLint>, std::pair<GLsizei, GLsizei>> halved;
++std::mutex halved_lock;
++const GLsizei HALF_FROM = 1024;
++
++bool half_wanted() {
++    static const bool wanted = [] {
++        const char* v = getenv("MG_BC_HALF");
++        const bool on = v && !strcmp(v, "1");
++        if (on) fprintf(stderr, "MobileGlues BC: atlases kept at half their width and height (MG_BC_HALF=1)\n");
++        return on;
++    }();
++    return wanted;
++}
++
++// A whole level [texture]'s [level] is made, [width]x[height] to the game: whether it's kept at half that, which its
++// level 0 decides for the rest.
++bool halve(GLuint texture, GLint level, GLsizei width, GLsizei height) {
++    if (!half_wanted()) return false;
++    std::lock_guard<std::mutex> guard(halved_lock);
++    const bool half = level == 0 ? width >= HALF_FROM : halved.count({texture, 0}) > 0;
++    if (half) halved[{texture, level}] = {width, height};
++    else halved.erase({texture, level});
++    return half;
++}
++
++} // namespace
++
++namespace {
++// Shaders that ask a 2D texture's size (textureSize) or fetch its texels by position (texelFetch) were written for the
++// game's size: Factorio's trees take a pixel position from textureSize and turn it back into a place in the atlas with
++// the size it knows, so with a halved atlas their leaves came from the wrong sprites. Each such sampler gets a shift,
++// mg_half_<name>, 0 unless the texture bound to it is kept at half (then 1), set before each draw (mg_half_draw).
++struct HalfUniform {
++    GLint sampler, shift, last;
++};
++std::map<GLuint, std::set<std::string>> half_shader_samplers;   // shader -> its rewritten samplers
++std::map<GLuint, std::set<std::string>> half_program_samplers;  // program -> its shaders'
++std::map<GLuint, std::vector<HalfUniform>> half_program_uniforms;
++std::mutex half_shader_lock;
++
++bool word_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
++
++// [src] with its textureSize and texelFetch calls of [samplers] made to see the game's size; the ones it changed
++// go into [used].
++std::string half_rewrite(const std::string& src, const std::set<std::string>& samplers, std::set<std::string>& used) {
++    std::string out;
++    out.reserve(src.size());
++    size_t i = 0;
++    while (i < src.size()) {
++        const size_t a = src.find("textureSize", i), b = src.find("texelFetch", i), at = std::min(a, b);
++        if (at == std::string::npos) {
++            out.append(src, i, std::string::npos);
++            break;
++        }
++        const bool size = at == a;
++        const size_t name_end = at + (size ? 11 : 10);
++        size_t open = name_end;
++        while (open < src.size() && isspace((unsigned char)src[open])) open++;
++        if ((at > 0 && word_char(src[at - 1])) || open >= src.size() || src[open] != '(' ||
++            (name_end < src.size() && word_char(src[name_end]))) {
++            out.append(src, i, name_end - i);
++            i = name_end;
++            continue;
++        }
++        // Its arguments, split at the top level.
++        std::vector<std::string> args;
++        int depth = 0;
++        size_t start = open + 1, close = std::string::npos;
++        for (size_t k = open + 1; k < src.size(); k++) {
++            const char c = src[k];
++            if (c == '(') depth++;
++            else if (c == ')' && depth > 0) depth--;
++            else if ((c == ',' || c == ')') && depth == 0) {
++                args.push_back(src.substr(start, k - start));
++                start = k + 1;
++                if (c == ')') {
++                    close = k;
++                    break;
++                }
++            }
++        }
++        std::string name = args.empty() ? "" : args[0];
++        name.erase(0, name.find_first_not_of(" \t\n"));
++        name.erase(name.find_last_not_of(" \t\n") + 1);
++        if (close == std::string::npos || !samplers.count(name) || (!size && args.size() < 2)) {
++            out.append(src, i, name_end - i);
++            i = name_end;
++            continue;
++        }
++        for (size_t k = 1; k < args.size(); k++) args[k] = half_rewrite(args[k], samplers, used);
++        std::string call = (size ? "textureSize(" : "texelFetch(") + args[0];
++        for (size_t k = 1; k < args.size(); k++)
++            call += ", " + (!size && k == 1 ? "((" + args[k] + ") >> mg_half_" + name + ")" : args[k]);
++        call += ")";
++        out.append(src, i, at - i);
++        out += size ? "(" + call + " << mg_half_" + name + ")" : call;
++        used.insert(name);
++        i = close + 1;
++    }
++    return out;
++}
+ } // namespace
++
++std::string mg_half_shader(GLuint shader, const std::string& src) {
++    if (!half_wanted()) return src;
++    static const std::regex decl(R"(uniform\s+(?:(?:lowp|mediump|highp)\s+)?sampler2D\s+([A-Za-z_]\w*)\s*;)");
++    std::set<std::string> samplers, used;
++    for (auto it = std::sregex_iterator(src.begin(), src.end(), decl); it != std::sregex_iterator(); ++it)
++        samplers.insert((*it)[1].str());
++    if (samplers.empty() || (src.find("textureSize") == std::string::npos && src.find("texelFetch") == std::string::npos))
++        return src;
++    std::string out = half_rewrite(src, samplers, used);
++    if (used.empty()) return src;
++    // Each shift declared right after its sampler.
++    for (const std::string& name : used) {
++        const std::regex own(R"(uniform\s+(?:(?:lowp|mediump|highp)\s+)?sampler2D\s+)" + name + R"(\s*;)");
++        std::smatch m;
++        if (std::regex_search(out, m, own))
++            out.insert((size_t)(m.position(0) + m.length(0)), "\nuniform int mg_half_" + name + ";");
++    }
++    std::lock_guard<std::mutex> guard(half_shader_lock);
++    half_shader_samplers[shader] = used;
++    return out;
++}
++
++void mg_half_attach(GLuint program, GLuint shader) {
++    if (!half_wanted()) return;
++    std::lock_guard<std::mutex> guard(half_shader_lock);
++    auto found = half_shader_samplers.find(shader);
++    if (found != half_shader_samplers.end()) half_program_samplers[program].insert(found->second.begin(), found->second.end());
++}
++
++void mg_half_link(GLuint program) {
++    if (!half_wanted()) return;
++    std::lock_guard<std::mutex> guard(half_shader_lock);
++    auto found = half_program_samplers.find(program);
++    if (found == half_program_samplers.end()) return;
++    std::vector<HalfUniform> uniforms;
++    for (const std::string& name : found->second) {
++        const GLint sampler = GLES.glGetUniformLocation(program, name.c_str());
++        const GLint shift = GLES.glGetUniformLocation(program, ("mg_half_" + name).c_str());
++        if (sampler >= 0 && shift >= 0) uniforms.push_back({sampler, shift, -1});
++    }
++    half_program_uniforms[program] = uniforms;
++}
++
++void mg_half_draw() {
++    if (!half_wanted() || !gl_state) return;
++    const GLuint program = gl_state->current_program;
++    std::lock_guard<std::mutex> guard(half_shader_lock);
++    auto found = half_program_uniforms.find(program);
++    if (found == half_program_uniforms.end()) return;
++    for (HalfUniform& u : found->second) {
++        GLint unit = 0;
++        GLES.glGetUniformiv(program, u.sampler, &unit);
++        GLuint texture = 0;
++        if (!mg_driver_texture_binding_at_unit(unit, GL_TEXTURE_2D, &texture)) {
++            const int active = mg_driver_active_texture_unit();
++            GLES.glActiveTexture(GL_TEXTURE0 + unit);
++            GLint bound = 0;
++            GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++            GLES.glActiveTexture(GL_TEXTURE0 + active);
++            texture = (GLuint)bound;
++        }
++        GLsizei w = 0, h = 0;
++        const GLint shift = texture && mg_half_size(texture, 0, &w, &h) ? 1 : 0;
++        if (shift != u.last) {
++            GLES.glUniform1i(u.shift, shift);
++            u.last = shift;
++        }
++    }
++}
+ 
++bool mg_half_size(GLuint texture, GLint level, GLsizei* width, GLsizei* height) {
++    std::lock_guard<std::mutex> guard(halved_lock);
++    auto found = halved.find({texture, level});
++    if (found == halved.end()) return false;
++    *width = found->second.first;
++    *height = found->second.second;
++    return true;
++}
++
++void mg_half_forget(GLuint texture, GLint level) {
++    std::lock_guard<std::mutex> guard(halved_lock);
++    if (level >= 0) {
++        halved.erase({texture, level});
++        return;
++    }
++    for (auto it = halved.lower_bound({texture, -1}); it != halved.end() && it->first.first == texture;)
++        it = halved.erase(it);
++}
++
+ GLenum mg_astc_for(GLenum bc) {
+     switch (bc) {
+     case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+@@ -731,6 +969,7 @@
+         GLES.glUniform1ui(1, job.kind);
+         GLES.glUniform1ui(2, (GLuint)job.src_word);
+         GLES.glUniform1ui(3, (GLuint)job.dst_word);
++        GLES.glUniform2ui(4, job.rbw, job.rbh);
+         GLES.glDispatchCompute((job.bw + 7) / 8, (job.bh + 7) / 8, 1);
+     }
+     GLES.glMemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
+@@ -892,11 +1131,11 @@
+ 
+ } // namespace
+ 
+-bool mg_astc_upload(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum bc,
++bool mg_astc_upload(GLenum target, GLint level, GLint gx, GLint gy, GLsizei gwidth, GLsizei gheight, GLenum bc,
+                     const uint8_t* blocks, size_t size, bool whole) {
+     const unsigned kind = kind_of(bc);
+-    const GLuint bw = (GLuint)(width + 3) / 4, bh = (GLuint)(height + 3) / 4;
+-    const size_t in_bytes = blocks ? (size_t)bw * bh * in_bytes_of(kind) : 0, out = out_bytes_of(kind);
++    const GLuint gbw = (GLuint)(gwidth + 3) / 4, gbh = (GLuint)(gheight + 3) / 4;   // the game's blocks, as given
++    const size_t in_bytes = blocks ? (size_t)gbw * gbh * in_bytes_of(kind) : 0, out = out_bytes_of(kind);
+     // Ready first: building the encoder checks EAC, which may leave BC4 and BC5 decoded.
+     if (!mg_astc_for(bc) || !mg_astc_ready() || (blocks && size < in_bytes)) return false;
+     const GLenum astc = mg_astc_for(bc);
+@@ -904,8 +1143,30 @@
+     Encoder& encoder = current();
+     GLint texture = 0;
+     GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    // Kept at half the game's size (halve): x, y, width and height are what's stored, each block the average of the
++    // 2x2 the game gave under it. An upload's region starts on an even block: bc_shadow.cpp widens it to one.
++    GLsizei level_w = gwidth, level_h = gheight;
++    const bool half = whole ? halve((GLuint)texture, level, gwidth, gheight)
++                            : mg_half_size((GLuint)texture, level, &level_w, &level_h);
++    GLint x = gx, y = gy;
++    GLsizei width = gwidth, height = gheight;
++    if (half) {
++        if (gx % 8 || gy % 8) {
++            static int said = 0;
++            if (said++ < 3)
++                fprintf(stderr, "MobileGlues BC: an upload at %d,%d of texture %u level %d, kept at half, isn't on an "
++                        "even block: left out\n", gx, gy, (GLuint)texture, level);
++            return true;
++        }
++        x = gx / 2;
++        y = gy / 2;
++        width = std::min((GLsizei)((gbw + 1) / 2 * 4), std::max(1, level_w / 2) - x);
++        height = std::min((GLsizei)((gbh + 1) / 2 * 4), std::max(1, level_h / 2) - y);
++    }
++    const GLuint bw = (GLuint)(width + 3) / 4, bh = (GLuint)(height + 3) / 4;
+     std::lock_guard<std::mutex> guard(encoder.queue_lock);
+-    Job job{(GLuint)texture, target, astc, level, x, y, width, height, kind, bw, bh, 0, 0, whole, out};
++    Job job{(GLuint)texture, target, astc, level, x, y, width, height, kind, bw, bh, 0, 0, whole, out,
++            half ? gbw : 0u, half ? gbh : 0u};
+     if (whole) {
+         // A level made, or remade. What's waiting for it goes first. The level is made now, its blocks come with the
+         // batch: Factorio makes some 3,000 while loading, and each made at once waited for the GPU. Where the driver
+@@ -975,12 +1236,15 @@
+                 fprintf(stderr, "MobileGlues BC: texture %u level %d, %dx%d of 0x%x: emptying it gave GL error 0x%x\n",
+                         (GLuint)texture, level, width, height, astc, error);
+             if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
++            // Not made: the caller makes it uncompressed, at the game's size.
++            if (error != GL_NO_ERROR && half) mg_half_forget((GLuint)texture, level);
+             return error == GL_NO_ERROR;
+         }
+         if (unpack) GLES.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack);
+         if (!made) {
+             const size_t before = encoded;
+             run(encoder, {job}, blocks, in_bytes, (size_t)bw * bh * out / 4);
++            if (encoded == before && half) mg_half_forget((GLuint)texture, level);
+             return encoded > before;
+         }
+         job.whole = false;
+@@ -988,17 +1252,20 @@
+     // In strips of block rows that fit a batch (BATCH_BYTES): a level loaded whole, as Fast start's cache loads every
+     // atlas, went to the GPU at once, in buffers its size, and the driver kept each while the next came: 2.1 GB of
+     // GPU memory for 1.3 GB of textures on a Xiaomi 12T, 3.3 GB in all.
+-    const size_t in_row = (size_t)bw * in_bytes_of(kind), out_row = (size_t)bw * out;
+-    const GLuint rows = (GLuint)std::max<size_t>(1, BATCH_BYTES / std::max(in_row, out_row));
++    // Kept at half, each row of blocks comes from two of the game's.
++    const size_t src_row = (size_t)(half ? gbw : bw) * in_bytes_of(kind), out_row = (size_t)bw * out;
++    const GLuint per = half ? 2 : 1, src_rows = half ? gbh : bh;
++    const GLuint rows = (GLuint)std::max<size_t>(1, BATCH_BYTES / std::max(src_row * per, out_row));
+     for (GLuint r = 0; r < bh; r += rows) {
+-        const GLuint n = std::min(rows, bh - r);
++        const GLuint n = std::min(rows, bh - r), s0 = r * per, s1 = std::min(src_rows, (r + n) * per);
+         Job strip = job;
+         strip.y = job.y + (GLint)(r * 4);
+         strip.height = std::min((GLsizei)(n * 4), job.height - (GLsizei)(r * 4));
+         strip.bh = n;
++        if (half) strip.rbh = s1 - s0;
+         strip.src_word = encoder.staged.size() / 4;
+         strip.dst_word = encoder.words;
+-        encoder.staged.insert(encoder.staged.end(), blocks + r * in_row, blocks + (r + n) * in_row);
++        encoder.staged.insert(encoder.staged.end(), blocks + s0 * src_row, blocks + s1 * src_row);
+         encoder.words += n * out_row / 4;
+         encoder.jobs.push_back(strip);
+         queued++;
+@@ -1036,6 +1303,7 @@
+ } // namespace
+ 
+ void mg_astc_flush() {
++    mg_half_draw();
+     if (queued.load() == 0) {
+         if (buffers_held.load() && now_ms() - last_batch_ms.load() > 3000) release_idle();
+         return;
+--- a/MobileGlues-cpp/gl/bc_astc.h
++++ b/MobileGlues-cpp/gl/bc_astc.h
+@@ -18,6 +18,20 @@
+ bool mg_astc_upload(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum bc,
+                     const uint8_t* blocks, size_t size, bool whole);
+ 
++// A level kept at half the game's size (MG_BC_HALF=1): true, with the game's [width] and [height] of it.
++bool mg_half_size(GLuint texture, GLint level, GLsizei* width, GLsizei* height);
++
++// [texture]'s levels kept at half, forgotten: [level]'s, or all of them when it's negative.
++void mg_half_forget(GLuint texture, GLint level);
++
++// A game shader's source, its textureSize and texelFetch calls made to see the game's size of a halved texture
++// (MG_BC_HALF); then the shaders a program has, its link, and each draw, which sets what the calls need.
++#include <string>
++std::string mg_half_shader(GLuint shader, const std::string& src);
++void mg_half_attach(GLuint program, GLuint shader);
++void mg_half_link(GLuint program);
++void mg_half_draw();
++
+ // The uploads waiting for a batch, done: before anything can draw with or read their textures.
+ void mg_astc_flush();
+ 
+--- a/MobileGlues-cpp/gl/bc_shadow.cpp
++++ b/MobileGlues-cpp/gl/bc_shadow.cpp
+@@ -148,6 +148,27 @@
+     }
+ }
+ 
++// The [w]x[h] blocks of [l] from block x, y, row after row.
++bool read_region(const Level& l, int x, int y, int w, int h, std::vector<uint8_t>& out) {
++    const int bb = block_bytes(l.format), level_bw = (l.width + 3) / 4;
++    const size_t row = (size_t)w * bb;
++    out.resize(row * h);
++    for (int r = 0; r < h; r++) {
++        const size_t at = ((size_t)(y + r) * level_bw + x) * bb;
++        if (at + row > l.size) return false;
++        if (l.offset < 0) {
++            memcpy(out.data() + r * row, l.memory.data() + at, row);
++            continue;
++        }
++        for (size_t done = 0; done < row;) {
++            ssize_t n = pread(store, out.data() + r * row + done, row - done, l.offset + (off_t)(at + done));
++            if (n <= 0) return false;
++            done += n;
++        }
++    }
++    return true;
++}
++
+ bool read_blocks(const Level& l, std::vector<uint8_t>& out) {
+     out.resize(l.size);
+     if (l.offset < 0) {
+@@ -734,8 +755,15 @@
+         // Storage made by glTexStorage2D or an empty glCompressedTexImage2D: the level's size from the driver.
+         Level l;
+         l.format = format;
+-        GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &l.width);
+-        GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &l.height);
++        GLsizei game_w = 0, game_h = 0;
++        if (mg_half_size(texture, level, &game_w, &game_h)) {
++            // Kept at half: the copy is the game's size.
++            l.width = game_w;
++            l.height = game_h;
++        } else {
++            GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_WIDTH, &l.width);
++            GLES.glGetTexLevelParameteriv(target, level, GL_TEXTURE_HEIGHT, &l.height);
++        }
+         allocate(l);
+         found = shadows.insert_or_assign({texture, level}, std::move(l)).first;
+     }
+@@ -754,7 +782,18 @@
+         for (int row = 0; row < bh && (size_t)(row + 1) * length <= (size_t)imageSize; row++)
+             write_blocks(l, ((size_t)(by + row) * level_bw + bx) * bb, blocks + (size_t)row * length, length);
+     });
+-    if (astc && !copied.empty())
++    GLsizei game_w = 0, game_h = 0;
++    if (astc && !copied.empty() && mg_half_size(texture, level, &game_w, &game_h)) {
++        // Kept at half (MG_BC_HALF): each block it keeps comes from 2x2 of the game's, so the upload grows to whole
++        // pairs of them, its neighbours read back from the copy, which has this upload now.
++        const int level_bh = (l.height + 3) / 4;
++        const int x0 = bx & ~1, y0 = by & ~1;
++        const int x1 = std::min(level_bw, (bx + bw + 1) & ~1), y1 = std::min(level_bh, (by + bh + 1) & ~1);
++        std::vector<uint8_t> region;
++        if (read_region(l, x0, y0, x1 - x0, y1 - y0, region))
++            mg_astc_upload(target, level, x0 * 4, y0 * 4, std::min((x1 - x0) * 4, l.width - x0 * 4),
++                           std::min((y1 - y0) * 4, l.height - y0 * 4), format, region.data(), region.size(), false);
++    } else if (astc && !copied.empty())
+         mg_astc_upload(target, level, xoffset, yoffset, width, height, format, copied.data(), copied.size(), false);
+     else if (decoded)
+         upload_decoded(target, level, xoffset, yoffset, width, height, format, copied, false);
+@@ -782,6 +821,13 @@
+ 
+ // glGetTexLevelParameteriv's compressed pnames, which OpenGL ES lacks: true when answered here.
+ bool mg_bc_level_parameter(GLenum target, GLint level, GLenum pname, GLint* params) {
++    // A level kept at half (MG_BC_HALF) is the game's size to the game.
++    GLsizei game_w = 0, game_h = 0;
++    if ((pname == GL_TEXTURE_WIDTH || pname == GL_TEXTURE_HEIGHT) && target == GL_TEXTURE_2D &&
++        mg_half_size(bound_2d(), level, &game_w, &game_h)) {
++        *params = pname == GL_TEXTURE_WIDTH ? game_w : game_h;
++        return true;
++    }
+     if (pname != GL_TEXTURE_COMPRESSED_IMAGE_SIZE && pname != GL_TEXTURE_COMPRESSED &&
+         pname != GL_TEXTURE_INTERNAL_FORMAT) return false;
+     std::lock_guard<std::mutex> guard(lock);
+@@ -850,6 +896,7 @@
+ 
+ void mg_bc_forget(GLsizei n, const GLuint* textures) {
+     for (GLsizei i = 0; i < n; i++) mg_astc_flush_for(textures[i], -1);
++    for (GLsizei i = 0; i < n; i++) mg_half_forget(textures[i], -1);
+     {
+         std::lock_guard<std::mutex> guard(made_lock);
+         for (GLsizei i = 0; i < n; i++)
+@@ -956,6 +1003,7 @@
+ 
+ void mg_bc_forget_level(GLenum target, GLint level) {
+     if (target == GL_TEXTURE_2D) mg_astc_flush_for(bound_2d(), level);
++    if (target == GL_TEXTURE_2D) mg_half_forget(bound_2d(), level);
+     if (target != GL_TEXTURE_2D) return;
+     std::lock_guard<std::mutex> guard(lock);
+     shadows.erase({bound_2d(), level});
+--- a/MobileGlues-cpp/gl/shader.cpp
++++ b/MobileGlues-cpp/gl/shader.cpp
+@@ -16,6 +16,7 @@
+ #include "glsl/glsl_for_es.h"
+ #include "../config/settings.h"
+ #include "FSR1/FSR1.h"
++#include "bc_astc.h"
+ 
+ #define DEBUG 0
+ 
+@@ -74,6 +75,9 @@
+         }
+     }
+ 
++    // Pocket Foundry: sizes and texel positions of textures kept at half (MG_BC_HALF, bc_astc.cpp).
++    glsl_src = mg_half_shader(shader, glsl_src);
++
+     bool is_sampler_buffer_emulated = hardware->emulate_texture_buffer && check_if_sampler_buffer_used(glsl_src);
+ 
+     if (is_direct_shader(glsl_src.c_str())) {
+--- a/MobileGlues-cpp/gl/program.cpp
++++ b/MobileGlues-cpp/gl/program.cpp
+@@ -16,6 +16,7 @@
+ #include <iostream>
+ #include "../config/settings.h"
+ #include "drawing.h"
++#include "bc_astc.h"
+ 
+ #define DEBUG 0
+ 
+@@ -151,6 +152,7 @@
+     }
+ 
+     GLES.glLinkProgram(program);
++    mg_half_link(program);
+ 
+     CHECK_GL_ERROR
+ }
+@@ -182,6 +184,7 @@
+ 
+ void glAttachShader(GLuint program, GLuint shader) {
+     LOG()
++    mg_half_attach(program, shader);
+     LOG_D("glAttachShader(%u, %u)", program, shader)
+     if (hardware->emulate_texture_buffer && shader_map_is_sampler_buffer_emulated[shader])
+         program_map_is_sampler_buffer_emulated[program] = true;

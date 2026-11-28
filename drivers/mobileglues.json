@@ -14,6 +14,12 @@
       "label": "Wait for each frame",
       "about": "Off, the processor draws the next frame while the GPU finishes this one: up to twice as fast on older Malis. On, each frame shows as soon as it's drawn, which can be smoother on a phone already at 60 FPS.",
       "env": {"MGX11_OVERLAP": "0"}
+    },
+    {
+      "id": "low",
+      "label": "Low sprites",
+      "about": "Sprites kept at half their size: a quarter of the memory they take, a little softer. For a phone Android closes the game on.",
+      "env": {"MG_BC_HALF": "1"}
     }
   ],
   "source": {
@@ -44,7 +50,8 @@
       "patches/mobileglues-astc-encoder-by-name.patch",
       "patches/mobileglues-astc-buffer-uploads.patch",
       "patches/mobileglues-bc4-bc5-as-eac.patch",
-      "patches/mobileglues-encoder-batches.patch"
+      "patches/mobileglues-encoder-batches.patch",
+      "patches/mobileglues-half-atlases.patch"
     ],
     "licences": [
       "LICENSE",
